@@ -1611,6 +1611,9 @@ Tool calls: `tool_use` blocks are captured with `name` + the whitelisted primary
 
 **Intentionally not captured:** per-block tool-call timings, tool-call argument bodies beyond the primary target, any field outside `message.usage` and `message.content`. This matches the spec intent ("aggregate analytics, not a replay of every byte").
 
-<!-- Task 4 appends "### 4. Pricing freshness" here -->
+### 4. Pricing freshness — confirmed (no changes)
+
+`pricing.json` contains current entries for `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5` matching Anthropic's public per-million-token rates as of 2026-04-19. `claude-opus-4-6` is kept as a fallback for older transcripts. The `tier_fallback` object covers unknown model names by family (opus / sonnet / haiku).
+
 <!-- Task 5 appends "### 5. SQL injection surface" here -->
 <!-- Task 6 appends "### 6. Path-write safety" here -->
