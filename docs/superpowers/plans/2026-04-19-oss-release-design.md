@@ -1601,7 +1601,14 @@ Skills whose `SKILL.md` lives outside those roots (project-local `.claude/skills
 
 **Impact:** documented as a known limitation; no code change this pass.
 
-<!-- Task 3 appends "### 3. Scanner completeness" here -->
+### 3. Scanner completeness — confirmed
+
+Every `message.usage` field Claude Code emits is captured: input, output, cache-read, cache-create-5m, cache-create-1h. Top-level fields captured: `uuid`, `parentUuid`, `sessionId`, `cwd`, `gitBranch`, `version` (→ `cc_version`), `entrypoint`, `type`, `isSidechain`, `agentId`, `timestamp`, `promptId`. Nested `message.*` captured: `model`, `stop_reason`, `id` (→ `message_id` for streaming-snapshot dedup).
+
+Tool calls: `tool_use` blocks are captured with `name` + the whitelisted primary-input field (see `scanner._TARGET_FIELDS`). Other input fields (e.g. Edit's `old_string`/`new_string`) are intentionally dropped — the dashboard only needs the identifier/target, not the body. `tool_result` blocks are captured as synthetic `_tool_result` rows with `result_tokens = chars // 4` (approximate).
+
+**Intentionally not captured:** per-block tool-call timings, tool-call argument bodies beyond the primary target, any field outside `message.usage` and `message.content`. This matches the spec intent ("aggregate analytics, not a replay of every byte").
+
 <!-- Task 4 appends "### 4. Pricing freshness" here -->
 <!-- Task 5 appends "### 5. SQL injection surface" here -->
 <!-- Task 6 appends "### 6. Path-write safety" here -->
