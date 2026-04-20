@@ -73,6 +73,7 @@ class ServerTests(unittest.TestCase):
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/overview", method="HEAD")
         with urllib.request.urlopen(req) as resp:
             self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.read(), b"")
 
 
 if __name__ == "__main__":
