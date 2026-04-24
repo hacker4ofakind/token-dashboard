@@ -11,6 +11,7 @@ from token_dashboard.db import connect, init_db
 from token_dashboard.skill_budgets import (
     parse_budget_from_text,
     skill_actuals,
+    skill_costs,
 )
 
 
@@ -222,6 +223,92 @@ class SkillActualsTests(unittest.TestCase):
         actuals = skill_actuals(self.db, since="2026-04-15T00:00:00Z")
         self.assertNotIn("old", actuals)
         self.assertEqual(actuals["new"]["p50"], 222)
+
+
+class SkillCostsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "s.db")
+        init_db(self.db)
+        # Minimal pricing table covering one known model + tier fallback.
+        self.pricing = {
+            "models": {
+                "claude-haiku-4-5": {
+                    "input":           1.0,
+                    "output":          5.0,
+                    "cache_read":      0.1,
+                    "cache_create_5m": 1.25,
+                    "cache_create_1h": 2.0,
+                },
+            },
+            "tier_fallback": {
+                "haiku":  {"input": 1.0, "output": 5.0, "cache_read": 0.1,
+                           "cache_create_5m": 1.25, "cache_create_1h": 2.0},
+                "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3,
+                           "cache_create_5m": 3.75, "cache_create_1h": 6.0},
+                "opus":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,
+                           "cache_create_5m": 18.75, "cache_create_1h": 30.0},
+            },
+        }
+
+    def test_skill_costs_basic(self):
+        """Costs one invocation with known model; verifies the multiplication."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="a1", session="s1",
+                             target="billable", ts="2026-04-10T00:00:00Z")
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                "model, input_tokens, output_tokens, cache_read_tokens, "
+                "cache_create_5m_tokens, cache_create_1h_tokens) "
+                "VALUES ('m1', 's1', 'p', 'assistant', '2026-04-10T00:00:05Z', "
+                "'claude-haiku-4-5', 1000000, 200000, 0, 0, 0)"
+            )
+            c.commit()
+        costs = skill_costs(self.db, self.pricing)
+        # 1M input × $1/M + 200k output × $5/M = $1 + $1 = $2
+        self.assertIn("billable", costs)
+        self.assertAlmostEqual(costs["billable"]["cost_usd"], 2.0, places=4)
+        self.assertFalse(costs["billable"]["cost_estimated"])
+
+    def test_skill_costs_unknown_model_falls_back_to_tier(self):
+        """A model name matching a known tier (opus/sonnet/haiku) uses tier pricing and flags estimated."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="a1", session="s1",
+                             target="tiered", ts="2026-04-10T00:00:00Z")
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                "model, output_tokens) "
+                "VALUES ('m1', 's1', 'p', 'assistant', '2026-04-10T00:00:05Z', "
+                "'claude-opus-4-99-unreleased', 1000000)"
+            )
+            c.commit()
+        costs = skill_costs(self.db, self.pricing)
+        # 1M output × $75/M (opus tier fallback) = $75
+        self.assertAlmostEqual(costs["tiered"]["cost_usd"], 75.0, places=2)
+        self.assertTrue(costs["tiered"]["cost_estimated"])
+
+    def test_skill_costs_aggregates_across_models(self):
+        """A single skill window hitting two models costs each separately and sums."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="a1", session="s1",
+                             target="mixed", ts="2026-04-10T00:00:00Z")
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                "model, output_tokens) "
+                "VALUES ('m1', 's1', 'p', 'assistant', '2026-04-10T00:00:05Z', "
+                "'claude-haiku-4-5', 1000000)"
+            )
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                "model, output_tokens) "
+                "VALUES ('m2', 's1', 'p', 'assistant', '2026-04-10T00:00:10Z', "
+                "'claude-opus-4-7', 100000)"
+            )
+            c.commit()
+        costs = skill_costs(self.db, self.pricing)
+        # haiku output 1M × $5 = $5, opus output 100k × $75 = $7.5 → total $12.5
+        self.assertAlmostEqual(costs["mixed"]["cost_usd"], 12.5, places=2)
+        self.assertTrue(costs["mixed"]["cost_estimated"])  # opus was tier-fallback
 
 
 if __name__ == "__main__":

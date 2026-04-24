@@ -113,6 +113,96 @@ _META_USER_PREFIXES = (
 )
 
 
+def skill_costs(db_path, pricing, since=None, until=None) -> dict[str, dict]:
+    """Return ``{slug: {cost_usd, cost_estimated}}`` — total assistant-side
+    cost spent within each skill's attribution window.
+
+    Uses the same window-bounds logic as ``skill_actuals`` (exclude sidechain,
+    cap at next Skill or next real-user-typed message). Groups tokens by
+    (skill, model) so each bucket is priced with the matching model's rate;
+    falls back to tier-level pricing for unknown-but-named models.
+
+    Answers "which skill actually costs the most dollars" — a direct
+    ranking signal that the p50/p95 output view doesn't surface (a skill
+    with small p50 but many invocations can still dominate monthly spend).
+    """
+    from .pricing import cost_for as _cost_for
+
+    rng, args = _range_clause(since, until)
+    not_like = " AND ".join(
+        ["u.prompt_text NOT LIKE ?"] * len(_META_USER_PREFIXES)
+    )
+    like_args = [p + "%" for p in _META_USER_PREFIXES]
+    sql = f"""
+      WITH calls AS (
+        SELECT session_id,
+               target     AS skill,
+               timestamp  AS start_ts,
+               LEAD(timestamp) OVER (
+                 PARTITION BY session_id ORDER BY timestamp
+               ) AS next_skill_ts
+          FROM tool_calls
+         WHERE tool_name = 'Skill'
+           AND target IS NOT NULL
+           AND target != ''
+           {rng}
+      ),
+      bounds AS (
+        SELECT c.session_id, c.skill, c.start_ts, c.next_skill_ts,
+               (SELECT MIN(u.timestamp) FROM messages u
+                 WHERE u.session_id   = c.session_id
+                   AND u.type         = 'user'
+                   AND u.is_sidechain = 0
+                   AND u.prompt_chars IS NOT NULL
+                   AND u.prompt_chars > 0
+                   AND u.prompt_text  IS NOT NULL
+                   AND u.timestamp    > c.start_ts
+                   AND {not_like}
+               ) AS next_user_ts
+          FROM calls c
+      )
+      SELECT b.skill,
+             COALESCE(m.model, 'unknown')                    AS model,
+             COALESCE(SUM(m.input_tokens), 0)                AS input_tokens,
+             COALESCE(SUM(m.output_tokens), 0)               AS output_tokens,
+             COALESCE(SUM(m.cache_read_tokens), 0)           AS cache_read_tokens,
+             COALESCE(SUM(m.cache_create_5m_tokens), 0)      AS cache_create_5m_tokens,
+             COALESCE(SUM(m.cache_create_1h_tokens), 0)      AS cache_create_1h_tokens
+        FROM bounds b
+        LEFT JOIN messages m
+          ON m.session_id   = b.session_id
+         AND m.type         = 'assistant'
+         AND m.is_sidechain = 0
+         AND m.timestamp    > b.start_ts
+         AND (b.next_skill_ts IS NULL OR m.timestamp < b.next_skill_ts)
+         AND (b.next_user_ts  IS NULL OR m.timestamp < b.next_user_ts)
+       GROUP BY b.skill, m.model
+    """
+    args = [*args, *like_args]
+    out: dict[str, dict] = {}
+    with connect(db_path) as conn:
+        for row in conn.execute(sql, args):
+            usage = {
+                "input_tokens":           row["input_tokens"],
+                "output_tokens":          row["output_tokens"],
+                "cache_read_tokens":      row["cache_read_tokens"],
+                "cache_create_5m_tokens": row["cache_create_5m_tokens"],
+                "cache_create_1h_tokens": row["cache_create_1h_tokens"],
+            }
+            c = _cost_for(row["model"] or "", usage, pricing)
+            entry = out.setdefault(row["skill"], {"cost_usd": 0.0, "cost_estimated": False})
+            if c["usd"] is None:
+                # Model not in pricing and no tier match: flag estimated, skip add.
+                entry["cost_estimated"] = True
+                continue
+            entry["cost_usd"] += c["usd"]
+            if c["estimated"]:
+                entry["cost_estimated"] = True
+    for v in out.values():
+        v["cost_usd"] = round(v["cost_usd"], 4)
+    return out
+
+
 def skill_actuals(db_path, since=None, until=None) -> dict[str, dict]:
     """Return ``{slug: {p50, p95, count}}`` of output_tokens per invocation.
 

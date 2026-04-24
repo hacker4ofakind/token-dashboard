@@ -124,8 +124,9 @@ def build_handler(db_path: str, projects_dir: str):
                 rows = skill_breakdown(db_path, since, until)
                 catalog = cached_catalog(db_path)
                 # Lazy import so deleting skill_budgets.py keeps the server bootable.
-                from .skill_budgets import budget_for, skill_actuals
+                from .skill_budgets import budget_for, skill_actuals, skill_costs
                 actuals = skill_actuals(db_path, since, until)
+                costs = skill_costs(db_path, pricing, since, until)
                 for r in rows:
                     info = catalog.get(r["skill"])
                     r["tokens_per_call"] = info["tokens"] if info else None
@@ -138,6 +139,9 @@ def build_handler(db_path: str, projects_dir: str):
                         and a
                         and a["p50"] > r["budget_output_tokens"] * 1.2
                     )
+                    c = costs.get(r["skill"])
+                    r["total_cost_usd"] = c["cost_usd"] if c else None
+                    r["cost_estimated"] = bool(c and c["cost_estimated"])
                 return _send_json(self, rows)
             if path == "/api/by-model":
                 rows = model_breakdown(db_path, since, until)
