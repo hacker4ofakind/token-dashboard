@@ -482,5 +482,119 @@ class SkillSubagentCostsTests(unittest.TestCase):
         self.assertNotIn("leaf", sub)
 
 
+class SlashCommandAttributionTests(unittest.TestCase):
+    """Once a synthetic Skill row is in place for a slash-command invocation,
+    skill_costs/skill_actuals must attribute the following assistant work to
+    the slash-command slug, and close the window at the next real-user typed
+    message (neither `<command-name>` nor `<command-message>` counts).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "s.db")
+        init_db(self.db)
+        self.pricing = {
+            "models": {
+                "claude-haiku-4-5": {
+                    "input": 1.0, "output": 5.0, "cache_read": 0.1,
+                    "cache_create_5m": 1.25, "cache_create_1h": 2.0,
+                },
+            },
+            "tier_fallback": {
+                "haiku":  {"input": 1.0, "output": 5.0, "cache_read": 0.1,
+                           "cache_create_5m": 1.25, "cache_create_1h": 2.0},
+                "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3,
+                           "cache_create_5m": 3.75, "cache_create_1h": 6.0},
+                "opus":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,
+                           "cache_create_5m": 18.75, "cache_create_1h": 30.0},
+            },
+        }
+
+    def test_slash_command_row_receives_attribution_window(self):
+        """User types /demo-cmd at t0; assistant emits 200k output at t1;
+        user types a real follow-up at t2 → only t1 is attributed."""
+        with connect(self.db) as c:
+            # User message carrying the slash command (stays in messages).
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                "timestamp, prompt_text, prompt_chars) "
+                "VALUES ('u-cmd', 's1', 'p', 'user', '2026-04-24T07:12:56Z', "
+                "'<command-name>/demo-cmd</command-name>', 39)"
+            )
+            # Synthetic Skill row keyed on the same uuid (as ingest would emit).
+            _seed_skill_call(c, uuid="u-cmd", session="s1",
+                             target="demo-cmd", ts="2026-04-24T07:12:56Z")
+            # Assistant work inside window.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                "timestamp, model, output_tokens) "
+                "VALUES ('a1', 's1', 'p', 'assistant', '2026-04-24T07:13:00Z', "
+                "'claude-haiku-4-5', 200000)"
+            )
+            # Real user follow-up — must terminate the window.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                "timestamp, prompt_text, prompt_chars) "
+                "VALUES ('u-real', 's1', 'p', 'user', '2026-04-24T07:14:00Z', "
+                "'thanks, all good', 17)"
+            )
+            # Assistant work AFTER window.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                "timestamp, model, output_tokens) "
+                "VALUES ('a2', 's1', 'p', 'assistant', '2026-04-24T07:14:05Z', "
+                "'claude-haiku-4-5', 9999)"
+            )
+            c.commit()
+
+        actuals = skill_actuals(self.db)
+        self.assertIn("demo-cmd", actuals)
+        # Only a1 counts (a2 is past the real-user boundary).
+        self.assertEqual(actuals["demo-cmd"]["p50"], 200000)
+
+        costs = skill_costs(self.db, self.pricing)
+        # 200k output × $5/M = $1.00
+        self.assertAlmostEqual(costs["demo-cmd"]["cost_usd"], 1.0, places=4)
+
+    def test_command_message_prefix_does_not_terminate_window(self):
+        """Regression: a user record whose prompt_text starts with
+        `<command-message>` (one of the observed slash-command orderings)
+        must be recognised as a meta-message, NOT a real typed message.
+        Otherwise it would prematurely close a prior skill's window in the
+        same session."""
+        with connect(self.db) as c:
+            # Earlier skill invocation still open.
+            _seed_skill_call(c, uuid="sk1", session="s1",
+                             target="demo-skill", ts="2026-04-24T06:00:00Z")
+            # Assistant does work at t+1s.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                "timestamp, output_tokens) "
+                "VALUES ('m1', 's1', 'p', 'assistant', '2026-04-24T06:00:01Z', 300)"
+            )
+            # Later in the session, user types /demo-cmd; the record leads
+            # with <command-message>, not <command-name>.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                "timestamp, prompt_text, prompt_chars) "
+                "VALUES ('u-cmd', 's1', 'p', 'user', '2026-04-24T07:00:00Z', "
+                "?, 44)",
+                ("<command-message>demo-cmd</command-message>\n"
+                 "<command-name>/demo-cmd</command-name>",),
+            )
+            # More assistant work, still inside demo-skill's window if the
+            # prefix filter is correct.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                "timestamp, output_tokens) "
+                "VALUES ('m2', 's1', 'p', 'assistant', '2026-04-24T07:00:01Z', 400)"
+            )
+            c.commit()
+        actuals = skill_actuals(self.db)
+        # demo-skill's window stays open across the <command-message>-first
+        # user record → m1 + m2 both count (700 total).
+        self.assertEqual(actuals["demo-skill"]["p50"], 700)
+
+
 if __name__ == "__main__":
     unittest.main()

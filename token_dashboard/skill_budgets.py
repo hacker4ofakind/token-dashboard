@@ -107,6 +107,7 @@ _META_USER_PREFIXES = (
     "Base directory for this agent:",
     "<system-reminder>",
     "<command-name>",
+    "<command-message>",
     "<local-command-stdout>",
     "<local-command-caveat>",
     "[Request interrupted",

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from token_dashboard.db import init_db, default_db_path, overview_totals
-from token_dashboard.scanner import rescan_agent_targets, scan_dir
+from token_dashboard.scanner import rescan_agent_targets, rescan_slash_commands, scan_dir
 from token_dashboard.tips import all_tips
 
 
@@ -45,6 +45,16 @@ def cmd_rescan_agent_targets(args):
     print(
         f"Token Dashboard: reset {n['files_reset']} files, "
         f"re-parsed {n['messages']} messages, {n['tools']} tool calls"
+    )
+
+
+def cmd_rescan_slash_commands(args):
+    db = _db_path(args)
+    init_db(db)
+    n = rescan_slash_commands(db)
+    print(
+        f"Token Dashboard: synthesized {n['slash_commands_synthesized']} "
+        f"Skill rows from historical slash-command messages"
     )
 
 
@@ -105,6 +115,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("scan",  parents=[common]).set_defaults(func=cmd_scan)
     sub.add_parser("rescan-agent-targets", parents=[common]).set_defaults(func=cmd_rescan_agent_targets)
+    sub.add_parser("rescan-slash-commands", parents=[common]).set_defaults(func=cmd_rescan_slash_commands)
     sub.add_parser("today", parents=[common]).set_defaults(func=cmd_today)
     sub.add_parser("stats", parents=[common]).set_defaults(func=cmd_stats)
     sub.add_parser("tips",  parents=[common]).set_defaults(func=cmd_tips)

@@ -90,5 +90,79 @@ class SidechainTests(unittest.TestCase):
         self.assertAlmostEqual(tools[0]["result_tokens"], 1000, delta=10)
 
 
+class SlashCommandExtractionTests(unittest.TestCase):
+    """User-typed slash commands (`/foo`) must synthesize a Skill tool_call.
+
+    Claude Code logs them as a user-role record whose content is a string
+    containing `<command-name>/<slug></command-name>`. Two observed orderings
+    — `<command-name>` first or `<command-message>` first — must both match.
+    """
+
+    def _user_record(self, content):
+        return {
+            "type":        "user",
+            "uuid":        "u-cmd",
+            "sessionId":   "s1",
+            "timestamp":   "2026-04-24T07:12:56Z",
+            "isSidechain": False,
+            "message":     {"role": "user", "content": content},
+        }
+
+    def test_slash_command_name_first(self):
+        rec = self._user_record(
+            "<command-name>/demo-cmd</command-name>\n"
+            "<command-message>demo-cmd</command-message>\n"
+            "<command-args></command-args>"
+        )
+        _, tools = parse_record(rec, project_slug="p")
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["tool_name"], "Skill")
+        self.assertEqual(tools[0]["target"], "demo-cmd")
+        self.assertEqual(tools[0]["timestamp"], "2026-04-24T07:12:56Z")
+
+    def test_slash_command_message_first(self):
+        rec = self._user_record(
+            "<command-message>demo-cmd</command-message>\n"
+            "<command-name>/demo-cmd</command-name>"
+        )
+        _, tools = parse_record(rec, project_slug="p")
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["target"], "demo-cmd")
+
+    def test_plugin_namespaced_slug_preserves_colon(self):
+        rec = self._user_record("<command-name>/codex:review</command-name>")
+        _, tools = parse_record(rec, project_slug="p")
+        self.assertEqual(tools[0]["target"], "codex:review")
+
+    def test_list_content_with_text_blocks(self):
+        rec = self._user_record([
+            {"type": "text", "text": "<command-name>/demo-skill</command-name>"},
+        ])
+        _, tools = parse_record(rec, project_slug="p")
+        self.assertEqual(tools[0]["target"], "demo-skill")
+
+    def test_non_user_record_ignored(self):
+        rec = {
+            "type": "assistant", "uuid": "a1", "sessionId": "s1",
+            "timestamp": "t", "isSidechain": False,
+            "message": {"content": [{"type": "text",
+                                     "text": "<command-name>/foo</command-name>"}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}},
+        }
+        _, tools = parse_record(rec, project_slug="p")
+        # Assistant text doesn't count as a slash invocation.
+        self.assertEqual([t["tool_name"] for t in tools], [])
+
+    def test_ordinary_user_message_yields_no_skill_row(self):
+        rec = self._user_record("just a normal question about the code")
+        _, tools = parse_record(rec, project_slug="p")
+        self.assertEqual(tools, [])
+
+    def test_malformed_slug_rejected(self):
+        rec = self._user_record("<command-name>/not a slug</command-name>")
+        _, tools = parse_record(rec, project_slug="p")
+        self.assertEqual(tools, [])
+
+
 if __name__ == "__main__":
     unittest.main()

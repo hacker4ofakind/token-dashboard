@@ -2,11 +2,22 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 from .db import connect
+
+
+# Slash-command user messages (typed as `/foo` in Claude Code) arrive as a
+# user-role record whose content looks like `<command-name>/foo</command-name>`
+# (with optional `<command-message>`/`<command-args>` sibling tags, in any
+# order). The scanner synthesizes a `tool_name='Skill'` row from these so
+# user-invoked skills appear in skill_breakdown / skill_costs / skill_actuals
+# alongside assistant-initiated Skill tool_use blocks. Matches plugin-namespaced
+# slugs like `codex:review` via the `:` in the character class.
+_SLASH_CMD_RE = re.compile(r"<command-name>/([A-Za-z0-9_:-]+)</command-name>")
 
 
 INSERT_MSG = """
@@ -98,6 +109,40 @@ def _extract_tools(rec: dict) -> List[dict]:
     return out
 
 
+def _extract_slash_commands(rec: dict) -> List[dict]:
+    """Return a synthetic `Skill` tool_call row when a user record carries a
+    `<command-name>/<slug></command-name>` tag. At most one per record.
+
+    Claude Code logs user-typed slash commands without emitting an assistant
+    `tool_use` block, so the base scanner misses them. We key the synthetic
+    row on the user message's uuid/timestamp so the existing per-message
+    dedup (``DELETE FROM tool_calls WHERE message_uuid=?``) keeps rescans
+    idempotent.
+    """
+    if rec.get("type") != "user":
+        return []
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    else:
+        return []
+    m = _SLASH_CMD_RE.search(text)
+    if not m:
+        return []
+    return [{
+        "tool_name":     "Skill",
+        "target":        m.group(1),
+        "result_tokens": None,
+        "is_error":      0,
+        "timestamp":     rec.get("timestamp"),
+    }]
+
+
 def _extract_results(rec: dict) -> List[dict]:
     out = []
     content = (rec.get("message") or {}).get("content")
@@ -150,6 +195,7 @@ def parse_record(rec: dict, project_slug: str) -> Tuple[dict, List[dict]]:
         **_usage(rec),
     }
     tools = _extract_tools(rec)
+    tools.extend(_extract_slash_commands(rec))
     tools.extend(_extract_results(rec))
     if tools:
         msg["tool_calls_json"] = json.dumps(
@@ -315,3 +361,46 @@ def scan_dir(projects_root: Union[str, Path], db_path: Union[str, Path]) -> dict
             totals["files"]    += 1
         conn.commit()
     return totals
+
+
+def rescan_slash_commands(db_path: Union[str, Path]) -> dict:
+    """Synthesize ``tool_name='Skill'`` rows for already-ingested slash-command
+    user messages. No filesystem re-read required — ``prompt_text`` already
+    holds the ``<command-name>/<slug></command-name>`` tag.
+
+    Idempotent: a prior synthetic row on the same ``message_uuid`` is deleted
+    before re-inserting, so repeated runs are safe. Real assistant-initiated
+    ``Skill`` tool_use rows have distinct ``message_uuid`` values and aren't
+    touched.
+
+    One-shot utility for DBs populated before this extractor existed.
+    """
+    synthesized = 0
+    with connect(db_path) as conn:
+        rows = list(conn.execute(
+            "SELECT uuid, session_id, project_slug, timestamp, prompt_text "
+            "FROM messages "
+            "WHERE type='user' AND prompt_text LIKE '%<command-name>/%'"
+        ))
+        for row in rows:
+            m = _SLASH_CMD_RE.search(row["prompt_text"] or "")
+            if not m:
+                continue
+            conn.execute(
+                "DELETE FROM tool_calls "
+                "WHERE message_uuid=? AND tool_name='Skill'",
+                (row["uuid"],),
+            )
+            conn.execute(INSERT_TOOL, {
+                "message_uuid":  row["uuid"],
+                "session_id":    row["session_id"],
+                "project_slug": row["project_slug"],
+                "tool_name":     "Skill",
+                "target":        m.group(1),
+                "result_tokens": None,
+                "is_error":      0,
+                "timestamp":     row["timestamp"],
+            })
+            synthesized += 1
+        conn.commit()
+    return {"slash_commands_synthesized": synthesized}
