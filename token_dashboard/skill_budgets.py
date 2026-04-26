@@ -283,3 +283,104 @@ def skill_actuals(db_path, since=None, until=None) -> dict[str, dict]:
             "count": len(xs),
         }
     return out
+
+
+def skill_subagent_costs(db_path, pricing, since=None, until=None) -> dict[str, dict]:
+    """Return ``{slug: {cost_usd, cost_estimated, output_tokens}}`` — total
+    assistant-side cost of all subagent (sidechain) work dispatched by each
+    skill within its attribution window.
+
+    A subagent is any sidechain conversation with its own ``agent_id`` (the
+    hash in ``subagents/agent-<hash>.jsonl``) except auto-compaction
+    (``agent_id LIKE 'acompact%'``). Attribution ties each subagent to the
+    skill window that contains its FIRST sidechain message.
+
+    Window bounds: Skill call → next Skill call in session. This differs
+    from ``skill_costs``'s window, which ALSO closes at the first real
+    user-typed message — some interactive orchestrators ask the user a
+    question mid-execution and THEN dispatch subagents, so closing at
+    the user's reply would miss the whole point. The next Skill call
+    remains the correct boundary for "when did this orchestrator hand
+    off to a new one."
+
+    Nested subagents fall out naturally: the inner subagent's first
+    sidechain message is itself inside the outer skill's window, so the
+    inner agent_id attributes to the same orchestrator.
+    """
+    from .pricing import cost_for as _cost_for
+
+    rng, args = _range_clause(since, until)
+    sql = f"""
+      WITH calls AS (
+        SELECT session_id,
+               target     AS skill,
+               timestamp  AS start_ts,
+               LEAD(timestamp) OVER (
+                 PARTITION BY session_id ORDER BY timestamp
+               ) AS next_skill_ts
+          FROM tool_calls
+         WHERE tool_name = 'Skill'
+           AND target IS NOT NULL
+           AND target != ''
+           {rng}
+      ),
+      -- Each subagent is identified by (session_id, agent_id). Its "start"
+      -- is the earliest sidechain message with that agent_id. Auto-compaction
+      -- agents are excluded by the acompact%-prefix filter.
+      agent_starts AS (
+        SELECT session_id, agent_id, MIN(timestamp) AS start_ts
+          FROM messages
+         WHERE is_sidechain = 1
+           AND agent_id IS NOT NULL
+           AND agent_id NOT LIKE 'acompact%'
+         GROUP BY session_id, agent_id
+      ),
+      window_agents AS (
+        SELECT c.skill, c.session_id, a.agent_id
+          FROM calls c
+          JOIN agent_starts a
+            ON a.session_id = c.session_id
+           AND a.start_ts  > c.start_ts
+           AND (c.next_skill_ts IS NULL OR a.start_ts < c.next_skill_ts)
+      )
+      SELECT w.skill,
+             COALESCE(m.model, 'unknown')                    AS model,
+             COALESCE(SUM(m.input_tokens), 0)                AS input_tokens,
+             COALESCE(SUM(m.output_tokens), 0)               AS output_tokens,
+             COALESCE(SUM(m.cache_read_tokens), 0)           AS cache_read_tokens,
+             COALESCE(SUM(m.cache_create_5m_tokens), 0)      AS cache_create_5m_tokens,
+             COALESCE(SUM(m.cache_create_1h_tokens), 0)      AS cache_create_1h_tokens
+        FROM window_agents w
+        JOIN messages m
+          ON m.session_id   = w.session_id
+         AND m.agent_id     = w.agent_id
+         AND m.is_sidechain = 1
+         AND m.type         = 'assistant'
+       GROUP BY w.skill, m.model
+    """
+    out: dict[str, dict] = {}
+    with connect(db_path) as conn:
+        for row in conn.execute(sql, args):
+            usage = {
+                "input_tokens":           row["input_tokens"],
+                "output_tokens":          row["output_tokens"],
+                "cache_read_tokens":      row["cache_read_tokens"],
+                "cache_create_5m_tokens": row["cache_create_5m_tokens"],
+                "cache_create_1h_tokens": row["cache_create_1h_tokens"],
+            }
+            c = _cost_for(row["model"] or "", usage, pricing)
+            entry = out.setdefault(row["skill"], {
+                "cost_usd": 0.0,
+                "cost_estimated": False,
+                "output_tokens": 0,
+            })
+            entry["output_tokens"] += row["output_tokens"] or 0
+            if c["usd"] is None:
+                entry["cost_estimated"] = True
+                continue
+            entry["cost_usd"] += c["usd"]
+            if c["estimated"]:
+                entry["cost_estimated"] = True
+    for v in out.values():
+        v["cost_usd"] = round(v["cost_usd"], 4)
+    return out

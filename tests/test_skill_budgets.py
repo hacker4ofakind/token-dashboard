@@ -12,6 +12,7 @@ from token_dashboard.skill_budgets import (
     parse_budget_from_text,
     skill_actuals,
     skill_costs,
+    skill_subagent_costs,
 )
 
 
@@ -309,6 +310,176 @@ class SkillCostsTests(unittest.TestCase):
         # haiku output 1M × $5 = $5, opus output 100k × $75 = $7.5 → total $12.5
         self.assertAlmostEqual(costs["mixed"]["cost_usd"], 12.5, places=2)
         self.assertTrue(costs["mixed"]["cost_estimated"])  # opus was tier-fallback
+
+
+def _seed_sidechain(c, *, uuid, session, ts, agent_id, output_tokens=0,
+                    model="claude-opus-4-5", input_tokens=0, msg_type="assistant"):
+    """Seed a sidechain message. Real subagent messages carry an agentId
+    (the hash from subagents/agent-<hash>.jsonl); attribution joins on it.
+    """
+    c.execute(
+        "INSERT INTO messages (uuid, session_id, project_slug, type, is_sidechain, "
+        "timestamp, model, input_tokens, output_tokens, agent_id) "
+        "VALUES (?, ?, 'p', ?, 1, ?, ?, ?, ?, ?)",
+        (uuid, session, msg_type, ts, model, input_tokens, output_tokens, agent_id),
+    )
+
+
+class SkillSubagentCostsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "s.db")
+        init_db(self.db)
+        self.pricing = {
+            "models": {
+                "claude-opus-4-5": {
+                    "input":           15.0,
+                    "output":          75.0,
+                    "cache_read":      1.5,
+                    "cache_create_5m": 18.75,
+                    "cache_create_1h": 30.0,
+                },
+            },
+            "tier_fallback": {
+                "opus":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,
+                           "cache_create_5m": 18.75, "cache_create_1h": 30.0},
+                "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3,
+                           "cache_create_5m": 3.75, "cache_create_1h": 6.0},
+                "haiku":  {"input": 1.0, "output": 5.0, "cache_read": 0.1,
+                           "cache_create_5m": 1.25, "cache_create_1h": 2.0},
+            },
+        }
+
+    def test_single_dispatch_sums_sidechain(self):
+        """One Skill call → one subagent (agent_id=ag1) → two assistant messages."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="sk1", session="s1",
+                             target="orch-a", ts="2026-04-10T00:00:00Z")
+            # Subagent starts inside the window (user-injected prompt).
+            _seed_sidechain(c, uuid="u1", session="s1", agent_id="ag1",
+                            ts="2026-04-10T00:00:06Z", msg_type="user")
+            _seed_sidechain(c, uuid="a1", session="s1", agent_id="ag1",
+                            ts="2026-04-10T00:00:10Z", output_tokens=1000)
+            _seed_sidechain(c, uuid="a2", session="s1", agent_id="ag1",
+                            ts="2026-04-10T00:00:15Z", output_tokens=500)
+            c.commit()
+        sub = skill_subagent_costs(self.db, self.pricing)
+        self.assertIn("orch-a", sub)
+        self.assertEqual(sub["orch-a"]["output_tokens"], 1500)
+        # 1500 output × $75/M = $0.1125
+        self.assertAlmostEqual(sub["orch-a"]["cost_usd"], 0.1125, places=4)
+
+    def test_sidechain_past_window_end_still_attributed(self):
+        """Subagent started inside window, finishes AFTER user typed next message."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="sk1", session="s1",
+                             target="orch-b", ts="2026-04-10T00:00:00Z")
+            # Subagent started at t+6s (inside window).
+            _seed_sidechain(c, uuid="u1", session="s1", agent_id="ag1",
+                            ts="2026-04-10T00:00:06Z", msg_type="user")
+            # User types again, closing the skill's own-cost window.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                "prompt_text, prompt_chars, is_sidechain) "
+                "VALUES ('u-real', 's1', 'p', 'user', '2026-04-10T00:01:00Z', "
+                "'go ahead', 8, 0)"
+            )
+            # Subagent response arrives after the user typed — by lineage still qa's.
+            _seed_sidechain(c, uuid="a1", session="s1", agent_id="ag1",
+                            ts="2026-04-10T00:02:00Z", output_tokens=5000)
+            c.commit()
+        sub = skill_subagent_costs(self.db, self.pricing)
+        self.assertEqual(sub["orch-b"]["output_tokens"], 5000)
+
+    def test_two_skills_dispatches_disjoint(self):
+        """Skill A and skill B each dispatch one subagent; attribution doesn't cross."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="skA", session="s1",
+                             target="A", ts="2026-04-10T00:00:00Z")
+            _seed_sidechain(c, uuid="uA", session="s1", agent_id="agA",
+                            ts="2026-04-10T00:00:06Z", msg_type="user")
+            _seed_sidechain(c, uuid="aA", session="s1", agent_id="agA",
+                            ts="2026-04-10T00:00:10Z", output_tokens=100)
+            # Real user message → closes A's window.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                "prompt_text, prompt_chars, is_sidechain) "
+                "VALUES ('u1', 's1', 'p', 'user', '2026-04-10T00:01:00Z', "
+                "'run B', 6, 0)"
+            )
+            _seed_skill_call(c, uuid="skB", session="s1",
+                             target="B", ts="2026-04-10T00:02:00Z")
+            _seed_sidechain(c, uuid="uB", session="s1", agent_id="agB",
+                            ts="2026-04-10T00:02:06Z", msg_type="user")
+            _seed_sidechain(c, uuid="aB", session="s1", agent_id="agB",
+                            ts="2026-04-10T00:02:10Z", output_tokens=900)
+            c.commit()
+        sub = skill_subagent_costs(self.db, self.pricing)
+        self.assertEqual(sub["A"]["output_tokens"], 100)
+        self.assertEqual(sub["B"]["output_tokens"], 900)
+
+    def test_nested_subagent_attributed_to_root_skill(self):
+        """Team pattern: outer subagent dispatches an inner subagent during orchestrator's window."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="sk1", session="s1",
+                             target="orch-c", ts="2026-04-10T00:00:00Z")
+            # Outer subagent.
+            _seed_sidechain(c, uuid="u1", session="s1", agent_id="outer",
+                            ts="2026-04-10T00:00:06Z", msg_type="user")
+            _seed_sidechain(c, uuid="a1", session="s1", agent_id="outer",
+                            ts="2026-04-10T00:00:10Z", output_tokens=300)
+            # Inner subagent starts at t+12s — still inside team-audit's window.
+            _seed_sidechain(c, uuid="u2", session="s1", agent_id="inner",
+                            ts="2026-04-10T00:00:12Z", msg_type="user")
+            _seed_sidechain(c, uuid="a2", session="s1", agent_id="inner",
+                            ts="2026-04-10T00:00:20Z", output_tokens=700)
+            c.commit()
+        sub = skill_subagent_costs(self.db, self.pricing)
+        # outer (300) + inner (700) = 1000; both attributed to the root skill.
+        self.assertEqual(sub["orch-c"]["output_tokens"], 1000)
+
+    def test_dispatch_outside_skill_window_ignored(self):
+        """Subagent started before any Skill call is not attributed."""
+        with connect(self.db) as c:
+            # Subagent starts at t=00:00 with no preceding Skill call.
+            _seed_sidechain(c, uuid="u1", session="s1", agent_id="ag-orphan",
+                            ts="2026-04-10T00:00:00Z", msg_type="user")
+            _seed_sidechain(c, uuid="a1", session="s1", agent_id="ag-orphan",
+                            ts="2026-04-10T00:00:05Z", output_tokens=9999)
+            c.commit()
+        sub = skill_subagent_costs(self.db, self.pricing)
+        self.assertEqual(sub, {})
+
+    def test_auto_compaction_sidechain_ignored(self):
+        """agent_id prefixed acompact is auto-compaction, never counted."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="sk1", session="s1",
+                             target="brainstorming", ts="2026-04-10T00:00:00Z")
+            _seed_sidechain(c, uuid="u1", session="s1", agent_id="acompact-abc",
+                            ts="2026-04-10T00:00:05Z", msg_type="user")
+            _seed_sidechain(c, uuid="ac1", session="s1", agent_id="acompact-abc",
+                            ts="2026-04-10T00:00:10Z", output_tokens=2000)
+            c.commit()
+        sub = skill_subagent_costs(self.db, self.pricing)
+        self.assertNotIn("brainstorming", sub)
+
+    def test_skill_costs_unchanged_for_non_orchestrators(self):
+        """Regression: skill with no Agent dispatches has skill_costs unchanged and no subagent row."""
+        with connect(self.db) as c:
+            _seed_skill_call(c, uuid="sk1", session="s1",
+                             target="leaf", ts="2026-04-10T00:00:00Z")
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                "model, output_tokens, is_sidechain) "
+                "VALUES ('m1', 's1', 'p', 'assistant', '2026-04-10T00:00:05Z', "
+                "'claude-opus-4-5', 200, 0)"
+            )
+            c.commit()
+        own = skill_costs(self.db, self.pricing)
+        sub = skill_subagent_costs(self.db, self.pricing)
+        self.assertIn("leaf", own)
+        self.assertAlmostEqual(own["leaf"]["cost_usd"], 200 * 75.0 / 1_000_000, places=6)
+        self.assertNotIn("leaf", sub)
 
 
 if __name__ == "__main__":

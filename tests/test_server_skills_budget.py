@@ -99,5 +99,82 @@ class ServerSkillBudgetTests(unittest.TestCase):
         self.assertTrue(r["over_budget"])
 
 
+class ServerSkillSubagentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "t.db")
+        init_db(self.db)
+
+        with sqlite3.connect(self.db) as c:
+            # One main-chain user message so the project surfaces in catalog walks.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp) "
+                "VALUES ('u0', 's1', 'p', 'user', '2026-04-10T00:00:00Z')",
+            )
+            # Skill invocation.
+            c.execute(
+                "INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, timestamp, is_error) "
+                "VALUES ('a1', 's1', 'p', 'Skill', 'orchestrator', '2026-04-10T00:00:01Z', 0)",
+            )
+            # Own cost: main-chain assistant emits 100 output tokens on claude-opus-4-5.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, is_sidechain, timestamp, "
+                "model, output_tokens) "
+                "VALUES ('m1', 's1', 'p', 'assistant', 0, '2026-04-10T00:00:02Z', "
+                "'claude-opus-4-5', 100)",
+            )
+            # Sidechain subagent chain: user injection + assistant response.
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, is_sidechain, "
+                "timestamp, agent_id) "
+                "VALUES ('sc-u', 's1', 'p', 'user', 1, '2026-04-10T00:00:03Z', 'agX')",
+            )
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, is_sidechain, "
+                "timestamp, model, output_tokens, agent_id) "
+                "VALUES ('sc1', 's1', 'p', 'assistant', 1, '2026-04-10T00:00:04Z', "
+                "'claude-opus-4-5', 400, 'agX')",
+            )
+            c.commit()
+
+        skills._cache["at"] = 0.0
+        skills._cache["data"] = {}
+        skills._cache["key"] = None
+        skill_budgets._budget_cache.clear()
+
+        self.port = _free_port()
+        H = build_handler(self.db, projects_dir="/nonexistent")
+        self.httpd = http.server.HTTPServer(("127.0.0.1", self.port), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        skills._cache["at"] = 0.0
+        skills._cache["data"] = {}
+        skills._cache["key"] = None
+        skill_budgets._budget_cache.clear()
+
+    def _get(self, path):
+        return urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}").read()
+
+    def test_skills_endpoint_exposes_subagent_fields(self):
+        rows = json.loads(self._get("/api/skills"))
+        by_slug = {r["skill"]: r for r in rows}
+        self.assertIn("orchestrator", by_slug)
+        r = by_slug["orchestrator"]
+        self.assertIn("subagent_cost_usd", r)
+        self.assertIn("subagent_output_tokens", r)
+        self.assertIn("total_with_subagents_usd", r)
+        self.assertEqual(r["subagent_output_tokens"], 400)
+        # total_with_subagents_usd must equal own + subagent.
+        self.assertAlmostEqual(
+            r["total_with_subagents_usd"],
+            (r["total_cost_usd"] or 0.0) + (r["subagent_cost_usd"] or 0.0),
+            places=6,
+        )
+        # Subagent cost should be positive (400 output tokens on opus).
+        self.assertGreater(r["subagent_cost_usd"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
