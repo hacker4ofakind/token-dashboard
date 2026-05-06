@@ -72,6 +72,14 @@
     "max-20x": {
       "monthly": 200,
       "label": "Max 20x"
+    },
+    "team": {
+      "monthly": 20,
+      "label": "Team Standard"
+    },
+    "team-premium": {
+      "monthly": 100,
+      "label": "Team Premium"
     }
   }
 }
