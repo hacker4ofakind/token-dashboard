@@ -4,21 +4,20 @@ Thanks for considering a contribution! This is a small, stdlib-only Python proje
 
 ## Running the tests
 
+> On macOS/Linux, run python3 instead of python.
 ```bash
-python3 -m unittest discover tests
+python -m unittest discover tests
 ```
-
-That's it. No `pip install`, no fixtures to download. All tests run in under 5 seconds.
 
 If you're fixing a bug, add a failing test first. If you're adding a feature, add a test that exercises the happy path.
 
 ## Running the dashboard locally
 
 ```bash
-python3 cli.py dashboard --no-open
+python cli.py dashboard --no-open
 ```
 
-Open http://127.0.0.1:8080 in your browser. The server re-scans every 30 seconds and pushes updates over Server-Sent Events, so you'll see changes without a hard refresh.
+Open http://localhost:8080 in your browser. The server re-scans every 30 seconds and pushes updates over Server-Sent Events, so you'll see changes without a hard refresh.
 
 ## Code style
 
@@ -35,7 +34,7 @@ Component layout: `cli.py` (entry points) → `token_dashboard/scanner.py` (JSON
 1. Fork the repo.
 2. Create a branch: `git checkout -b feat/<short-description>` or `fix/<short-description>`.
 3. Make the change. Add or update tests.
-4. Run `python3 -m unittest discover tests` — must be green.
+4. Run `python -m unittest discover tests` — must be green.
 5. Commit with a conventional-commit-style message: `feat: add X`, `fix: handle Y`, `docs: update Z`.
 6. Push and open a PR against `main`. Describe the user-visible change and link to any relevant issue.
 

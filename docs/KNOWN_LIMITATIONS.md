@@ -22,7 +22,7 @@ If a transcript references a model ID not in `pricing.json` (e.g. a future snaps
 
 ## First scan can be slow
 
-The first `python3 cli.py scan` on a heavy user's machine can read tens of MB across hundreds of JSONLs. Subsequent scans are incremental (mtime + byte-offset tracking in the `files` table), so they're fast.
+The first `python cli.py scan` on a heavy user's machine can read tens of MB across hundreds of JSONLs. Subsequent scans are incremental (mtime + byte-offset tracking in the `files` table), so they're fast.
 
 ## Running two dashboards against the same DB
 

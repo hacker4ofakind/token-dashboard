@@ -22,24 +22,22 @@ A local dashboard that reads the JSONL transcripts Claude Code writes to `~/.cla
 - **Claude Code** — installed and with at least one session run. The dashboard reads those sessions. If you just installed Claude Code and haven't used it yet, run at least one prompt first.
 - **A web browser.** Any modern one.
 
-No `pip install`. No Node.js. No build step.
-
 ## Quickstart
 
+> On macOS/Linux, run python3 instead of python.
 ```bash
 git clone https://github.com/nateherkai/token-dashboard.git
 cd token-dashboard
-python3 cli.py dashboard
+python cli.py dashboard
 ```
 
-> On Windows, if `python3` isn't on your PATH, substitute `py -3` for `python3` in every command below.
 
 The command:
 1. Scans `~/.claude/projects/` (first run can take 20–60 seconds on a heavy user's machine).
-2. Starts a local server at http://127.0.0.1:8080.
+2. Starts a local server at http://localhost:8080.
 3. Opens your default browser to that URL.
 
-Leave it running; it re-scans every 30 seconds and pushes updates live. Stop with `Ctrl+C`.
+Leave it running; it re-scans every 30 seconds and pushes updates live. Stop with `Ctrl` + `C`.
 
 ## Where the data comes from
 
@@ -55,7 +53,7 @@ The dashboard never modifies those files — it only reads them and keeps a loca
 To point at a different location:
 
 ```bash
-python3 cli.py dashboard --projects-dir /path/to/projects --db /path/to/cache.db
+python cli.py dashboard --projects-dir /path/to/projects --db /path/to/cache.db
 ```
 
 ### Environment variables
@@ -72,18 +70,18 @@ Pricing lives in [`pricing.json`](pricing.json). Edit it directly if model price
 ## CLI reference
 
 ```bash
-python3 cli.py scan          # populate / refresh the local DB, then exit
-python3 cli.py today         # today's totals (terminal)
-python3 cli.py stats         # all-time totals (terminal)
-python3 cli.py tips          # active suggestions (terminal)
-python3 cli.py dashboard     # scan + serve the UI at http://localhost:8080
+python cli.py scan          # populate / refresh the local DB, then exit
+python cli.py today         # today's totals (terminal)
+python cli.py stats         # all-time totals (terminal)
+python cli.py tips          # active suggestions (terminal)
+python cli.py dashboard     # scan + serve the UI at http://localhost:8080
 
 # dashboard flags
-python3 cli.py dashboard --no-open   # don't auto-open the browser
-python3 cli.py dashboard --no-scan   # skip the initial scan (use cached DB only)
+python cli.py dashboard --no-open   # don't auto-open the browser
+python cli.py dashboard --no-scan   # skip the initial scan (use cached DB only)
 ```
 
-Change the port: `PORT=9000 python3 cli.py dashboard`.
+Change the port: `PORT=9000 python cli.py dashboard`.
 
 ## The 7 tabs
 
@@ -101,11 +99,11 @@ The Overview tab also has a built-in "What do these numbers mean?" panel that ex
 
 ## Troubleshooting
 
-**"No data" or empty charts.** Run `python3 cli.py scan` once to populate the DB, then reload.
+**"No data" or empty charts.** Run `python cli.py scan` once to populate the DB, then reload.
 
-**Port 8080 already in use.** `PORT=9000 python3 cli.py dashboard`.
+**Port 8080 already in use.** `PORT=8082 python cli.py dashboard`.
 
-**Numbers look wrong / stuck.** The DB lives at `~/.claude/token-dashboard.db`. Delete it and re-run `python3 cli.py scan` to rebuild from scratch.
+**Numbers look wrong / stuck.** The DB lives at `~/.claude/token-dashboard.db`. Run `rm -f ~/.claude/token-dashboard.db` and re-run `python cli.py scan` to rebuild from scratch.
 
 **Running the dashboard twice at the same time.** Don't — both processes will fight over the SQLite DB. Stop all instances before starting a new one.
 
@@ -132,7 +130,7 @@ Data flow: `cli.py` → `token_dashboard/scanner.py` → SQLite DB; `token_dashb
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Short version: fork, `python3 -m unittest discover tests` before opening a PR, keep it stdlib-only.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Short version: fork, `python -m unittest discover tests` before opening a PR, keep it stdlib-only.
 
 ## License
 

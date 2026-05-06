@@ -21,6 +21,7 @@ A local dashboard that reads Claude Code's JSONL session transcripts and shows t
 
 ## CLI commands
 
+> On macOS/Linux, run python3 instead of python.
 - `python cli.py scan` — populate the DB from JSONL files
 - `python cli.py today` — today's breakdown by model (terminal)
 - `python cli.py stats` — all-time stats (terminal)

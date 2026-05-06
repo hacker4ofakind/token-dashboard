@@ -9,8 +9,8 @@ Guidance for Claude Code and other agents when working in this repository.
 Inspired by [phuryn/claude-usage](https://github.com/phuryn/claude-usage) but diverges in UI (vanilla JS + ECharts, dark theme, hash router, SSE refresh) and scope (expensive-prompt drill-down, skills view, tips engine, streaming-snapshot dedup). See `docs/inspiration.md` for the original's feature set and known limitations.
 
 ## Status
-
-Working codebase. 68 Python unit tests (`python3 -m unittest discover tests`). Seven UI tabs wired up (Overview, Prompts, Sessions, Projects, Skills, Tips, Settings). Runs on macOS, Windows, and Linux.
+> On macOS/Linux, run python3 instead of python.
+Working codebase. 68 Python unit tests (`python -m unittest discover tests`). Seven UI tabs wired up (Overview, Prompts, Sessions, Projects, Skills, Tips, Settings). Runs on macOS, Windows, and Linux.
 
 ## Architecture
 
@@ -40,8 +40,9 @@ See `docs/KNOWN_LIMITATIONS.md`. Current summary: Skills `tokens_per_call` is po
 
 ## Verifying changes
 
+> On macOS/Linux, run python3 instead of python.
 ```bash
-python3 -m unittest discover tests        # all tests
-python3 cli.py dashboard --no-open        # start the server
+python -m unittest discover tests        # all tests
+python cli.py dashboard --no-open        # start the server
 curl http://127.0.0.1:8080/api/overview   # sanity-check an endpoint
 ```
