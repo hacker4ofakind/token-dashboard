@@ -14,7 +14,7 @@ A local dashboard that reads the JSONL transcripts Claude Code writes to `~/.cla
 - Comparing token usage across projects you've worked on.
 - Spotting wasteful patterns — the same file read twenty times in a session, a tool call returning 80k tokens.
 - Understanding what a "cache hit" actually saves you.
-- If you're on Pro or Max, confirming you're getting your money's worth in API-equivalent dollars.
+- If you're on Pro, Max, or Team, confirming you're getting your money's worth in API-equivalent dollars.
 
 ## Prerequisites
 
@@ -30,7 +30,6 @@ git clone https://github.com/nateherkai/token-dashboard.git
 cd token-dashboard
 python cli.py dashboard
 ```
-
 
 The command:
 1. Scans `~/.claude/projects/` (first run can take 20–60 seconds on a heavy user's machine).
