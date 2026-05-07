@@ -84,7 +84,7 @@ export function stackedBarChart(el, { categories, series, formatter }) {
     },
     xAxis: {
       ...X_AXIS, type: 'category', data: categories,
-      axisLabel: { ...X_AXIS.axisLabel, interval: categories.length > 20 ? 'auto' : 0, rotate: categories.length > 12 ? 45 : 0 },
+      axisLabel: { ...X_AXIS.axisLabel, interval: categories.length > 20 ? 'auto' : 0, rotate: 45 },
     },
     yAxis: { ...Y_AXIS, type: 'value' },
     series: series.map((s, i) => ({
