@@ -1,22 +1,22 @@
 // app.js — router, state, fetch helpers
 
-export const $  = (sel, root=document) => root.querySelector(sel);
-export const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+export const $ = (sel, root = document) => root.querySelector(sel);
+export const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 const COMPACT = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
 export const fmt = {
-  int:   n => (n ?? 0).toLocaleString(),
+  int: n => (n ?? 0).toLocaleString(),
   compact: n => COMPACT.format(n ?? 0),
-  usd:   n => n == null ? '—' : '$' + Number(n).toFixed(2),
-  usd4:  n => n == null ? '—' : '$' + Number(n).toFixed(4),
-  pct:   n => n == null ? '—' : (n * 100).toFixed(0) + '%',
-  short: (s, n=80) => s == null ? '' : (s.length > n ? s.slice(0, n - 1) + '…' : s),
-  htmlSafe: s => (s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),
+  usd: n => n == null ? '—' : '$' + Number(n).toFixed(2),
+  usd4: n => n == null ? '—' : '$' + Number(n).toFixed(4),
+  pct: n => n == null ? '—' : (n * 100).toFixed(0) + '%',
+  short: (s, n = 80) => s == null ? '' : (s.length > n ? s.slice(0, n - 1) + '…' : s),
+  htmlSafe: s => (s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
   modelClass: m => {
     const s = (m || '').toLowerCase();
-    if (s.includes('opus'))   return 'opus';
+    if (s.includes('opus')) return 'opus';
     if (s.includes('sonnet')) return 'sonnet';
-    if (s.includes('haiku'))  return 'haiku';
+    if (s.includes('haiku')) return 'haiku';
     return '';
   },
   modelShort: m => (m || '').replace('claude-', ''),
@@ -33,11 +33,11 @@ export const state = { plan: 'api', pricing: null };
 
 const ROUTES = {
   '/overview': () => import('/web/routes/overview.js'),
-  '/prompts':  () => import('/web/routes/prompts.js'),
+  '/prompts': () => import('/web/routes/prompts.js'),
   '/sessions': () => import('/web/routes/sessions.js'),
   '/projects': () => import('/web/routes/projects.js'),
-  '/skills':   () => import('/web/routes/skills.js'),
-  '/tips':     () => import('/web/routes/tips.js'),
+  '/skills': () => import('/web/routes/skills.js'),
+  '/tips': () => import('/web/routes/tips.js'),
   '/settings': () => import('/web/routes/settings.js'),
 };
 
@@ -50,7 +50,7 @@ function buildTopbar() {
       ${Object.keys(ROUTES).map(p => `<a href="#${p}" data-route="${p}">${p.slice(1)}</a>`).join('')}
     </nav>
     <div class="spacer"></div>
-    <span class="pill" id="plan-pill">api</span>
+    <a href="/#/settings" class="pill" id="plan-pill">api</a>
     <span class="pill muted" title="Cmd/Ctrl+B blurs sensitive text">⌘B blur</span>
   `;
   document.body.prepend(wrap);
@@ -86,7 +86,7 @@ async function firstRun() {
       <h2>Welcome — pick your plan</h2>
       <p>This sets how costs are displayed. Change it later in Settings.</p>
       <select id="firstplan" style="width:100%">
-        ${plans.map(([k,v]) => `<option value="${k}">${v.label}${v.monthly ? ` — $${v.monthly}/mo` : ''}</option>`).join('')}
+        ${plans.map(([k, v]) => `<option value="${k}">${v.label}${v.monthly ? ` — $${v.monthly}/mo` : ''}</option>`).join('')}
       </select>
       <div class="actions">
         <div class="spacer"></div>
@@ -131,9 +131,9 @@ async function boot() {
       try {
         const evt = JSON.parse(ev.data);
         if (evt.type === 'scan') render();
-      } catch {}
+      } catch { }
     };
-  } catch {}
+  } catch { }
 }
 
 boot();
