@@ -8,6 +8,7 @@ node_modules/
 .superpowers/
 .claude/
 docs/superpowers/
+claude_api_pricing.htm
 
 # Local launcher (per-user, not part of the public repo)
 start_dashboard.bat
