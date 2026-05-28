@@ -29,41 +29,91 @@ _VERSION_RE = re.compile(r"^\d+\.\d+")
 _STRUCTURE_NAMES = {"skills", "plugins", "marketplaces", "cache", ".claude"}
 
 
-def _slugs_for(skill_md: Path) -> list[str]:
-    """Return the slug(s) a Skill tool invocation could use to load this file.
+def _is_plausible_plugin_name(name: str) -> bool:
+    """A plugin name must not be a structural marker, version dir, temp-git slug, or carry a colon."""
+    return bool(
+        name
+        and name not in _STRUCTURE_NAMES
+        and not name.startswith("temp_git_")
+        and not _VERSION_RE.match(name)
+        and ":" not in name
+    )
 
-    Paths vary by install source:
-      marketplaces/<m>/plugins/<plugin>/skills/<skill>/SKILL.md
-      cache/<m>/<plugin>/<version>/skills/<skill>/SKILL.md
-      cache/temp_git_*/skills/<skill>/SKILL.md         (no plugin)
-      skills/<skill>/SKILL.md                          (no plugin)
-      scheduled-tasks/<skill>/SKILL.md                 (no plugin)
 
-    Strategy: always register the bare skill name. Additionally, walk up from
-    `skills/` and register `<ancestor>:<skill>` for every ancestor segment
-    that plausibly names a plugin (not a structural/version/temp-dir token).
-    Unused slugs are harmless — the user only invokes real ones.
+def _plugin_name_from_path(parts: tuple) -> Optional[str]:
+    """Identify the plugin name for a SKILL.md path, or None if not under a plugin.
+
+    Anchored on the two documented on-disk layouts (instead of probing every
+    ancestor, which on Windows leaks home-path segments like 'Users' / username
+    and on either OS leaks the marketplace name as if it were a plugin):
+
+      A) marketplaces install
+         .../plugins/marketplaces/<marketplace>/plugins/<plugin>/skills/<skill>/SKILL.md
+         → plugin sits at skills_idx - 1, with `plugins` at skills_idx - 2.
+
+      B) cache install, versioned
+         .../plugins/cache/<marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md
+         → plugin sits at skills_idx - 2, with a version dir at skills_idx - 1
+         and `cache` at skills_idx - 4.
+
+      C) cache install, unversioned (defensive — observed for some installs)
+         .../plugins/cache/<marketplace>/<plugin>/skills/<skill>/SKILL.md
+         → plugin sits at skills_idx - 1, with `cache` at skills_idx - 3.
+
+      D) cache install, temp git checkout (no plugin available)
+         .../plugins/cache/temp_git_*/skills/<skill>/SKILL.md → None
     """
-    parts = skill_md.parts
-    if "SKILL.md" not in parts or skill_md.name != "SKILL.md":
-        return []
-    skill_name = skill_md.parent.name
-    slugs = {skill_name}
-    # Locate the `skills` folder that contains this skill.
     try:
         skills_idx = len(parts) - 1 - parts[::-1].index("skills")
     except ValueError:
-        return list(slugs)
-    for seg in parts[:skills_idx]:
-        if not seg or seg in _STRUCTURE_NAMES:
-            continue
-        if _VERSION_RE.match(seg):
-            continue
-        if seg.startswith("temp_git_"):
-            continue
-        if seg.endswith(":") or ":" in seg:  # drive letters like "C:"
-            continue
-        slugs.add(f"{seg}:{skill_name}")
+        return None
+
+    # Layout A — marketplaces/<m>/plugins/<plugin>/skills/
+    if skills_idx >= 2 and parts[skills_idx - 2] == "plugins":
+        candidate = parts[skills_idx - 1]
+        if _is_plausible_plugin_name(candidate):
+            return candidate
+
+    # Layout B — cache/<m>/<plugin>/<version>/skills/
+    if (skills_idx >= 4
+            and _VERSION_RE.match(parts[skills_idx - 1])
+            and parts[skills_idx - 4] == "cache"):
+        candidate = parts[skills_idx - 2]
+        if _is_plausible_plugin_name(candidate):
+            return candidate
+
+    # Layout C — cache/<m>/<plugin>/skills/  (no version dir)
+    if skills_idx >= 3 and parts[skills_idx - 3] == "cache":
+        candidate = parts[skills_idx - 1]
+        if _is_plausible_plugin_name(candidate):
+            return candidate
+
+    return None
+
+
+def _slugs_for(skill_md: Path) -> list[str]:
+    """Return the slug(s) a Skill tool invocation could use to load this file.
+
+    Claude Code accepts only two slug forms:
+      "<skill-name>"            — bare, always registered
+      "<plugin>:<skill-name>"   — only when the file lives under a marketplace
+                                  or cache plugin directory (see
+                                  `_plugin_name_from_path` for the recognised
+                                  layouts)
+
+    Earlier revisions registered every non-structural ancestor segment as a
+    possible plugin prefix. That over-generated bogus slugs on Windows (the
+    home path's "Users" and the username became "plugin" prefixes) and even on
+    POSIX (the marketplace directory name was indistinguishable from the
+    plugin directory name). Strict layout matching avoids both.
+    """
+    if skill_md.name != "SKILL.md":
+        return []
+    skill_name = skill_md.parent.name
+    slugs = {skill_name}
+    plugin = _plugin_name_from_path(skill_md.parts)
+    if plugin and plugin != skill_name:
+        slugs.add(f"{plugin}:{skill_name}")
     return sorted(slugs)
 
 

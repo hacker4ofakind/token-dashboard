@@ -55,17 +55,49 @@ class CatalogTests(unittest.TestCase):
     def test_slugs_for_plugin_path(self):
         p = Path("plugins/marketplaces/x/plugins/superpowers/skills/brainstorming/SKILL.md")
         slugs = set(_slugs_for(p))
-        # Both forms must be present; extra ancestor aliases (e.g. marketplace name) are harmless.
-        self.assertIn("brainstorming", slugs)
-        self.assertIn("superpowers:brainstorming", slugs)
+        # Exactly two slugs: bare + plugin-qualified. No marketplace alias.
+        self.assertEqual(slugs, {"brainstorming", "superpowers:brainstorming"})
+
+    def test_slugs_for_marketplace_is_not_a_plugin_prefix(self):
+        # The marketplace directory name (`x` below) must NEVER be registered
+        # as a plugin prefix — Claude Code only accepts <plugin>:<skill>.
+        p = Path("plugins/marketplaces/x/plugins/superpowers/skills/brainstorming/SKILL.md")
+        slugs = set(_slugs_for(p))
+        self.assertNotIn("x:brainstorming", slugs)
+        self.assertNotIn("plugins:brainstorming", slugs)
+        self.assertNotIn("marketplaces:brainstorming", slugs)
 
     def test_slugs_for_cache_versioned_path(self):
         p = Path("plugins/cache/claude-plugins-official/superpowers/5.0.7/skills/brainstorming/SKILL.md")
         slugs = set(_slugs_for(p))
-        self.assertIn("brainstorming", slugs)
-        self.assertIn("superpowers:brainstorming", slugs)
-        # version segment must NOT become a slug prefix
+        self.assertEqual(slugs, {"brainstorming", "superpowers:brainstorming"})
+        # No version segment, no marketplace name leakage.
         self.assertNotIn("5.0.7:brainstorming", slugs)
+        self.assertNotIn("claude-plugins-official:brainstorming", slugs)
+
+    def test_slugs_for_cache_unversioned_path(self):
+        # Defensive: some cache layouts skip the version directory.
+        p = Path("plugins/cache/claude-plugins-official/superpowers/skills/brainstorming/SKILL.md")
+        slugs = set(_slugs_for(p))
+        self.assertEqual(slugs, {"brainstorming", "superpowers:brainstorming"})
+
+    def test_slugs_for_cache_temp_git_has_no_plugin_prefix(self):
+        # temp_git_* checkouts never expose a plugin name; only bare is valid.
+        p = Path("plugins/cache/temp_git_abc123/skills/brainstorming/SKILL.md")
+        self.assertEqual(_slugs_for(p), ["brainstorming"])
+
+    def test_slugs_for_windows_path_no_home_pollution(self):
+        # Regression: on Windows the absolute path includes the home segments
+        # ("Users", "<username>"). They must NOT become plugin prefixes.
+        # Using a constructed parts-tuple to exercise the algorithm without
+        # depending on which OS the test runs on.
+        from token_dashboard.skills import _plugin_name_from_path
+        windows_parts = (
+            "C:\\", "Users", "marcu", ".claude", "plugins", "marketplaces",
+            "buzzwoo-claude-plugins", "plugins", "buzzwoo-ecom-shopware",
+            "skills", "shopware-app-system", "SKILL.md",
+        )
+        self.assertEqual(_plugin_name_from_path(windows_parts), "buzzwoo-ecom-shopware")
 
     def test_slugs_for_user_skill(self):
         p = Path(".claude/skills/frontend-design/SKILL.md")

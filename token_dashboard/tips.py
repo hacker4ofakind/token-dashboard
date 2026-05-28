@@ -348,12 +348,29 @@ def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
             (since,),
         )}
 
-    # Rank skills by least-used × largest description; those are the cheapest to drop.
-    ranked = []
+    # Group slugs by the SKILL.md they resolve to: a single file commonly
+    # registers two slugs (bare + "<plugin>:<bare>"), and the ranking must not
+    # double-count it or pollute the candidates list with two display lines.
+    per_path: dict[str, dict] = {}
     for slug, info in catalog.items():
-        ranked.append((used.get(slug, 0), -len(_read_skill_description(info["path"])), slug))
-    ranked.sort()
-    worst = [slug for _, _, slug in ranked[:5]]
+        entry = per_path.setdefault(info["path"], {"slugs": [], "usage": 0})
+        entry["slugs"].append(slug)
+        entry["usage"] += used.get(slug, 0)
+    for p, entry in per_path.items():
+        entry["desc_chars"] = len(_read_skill_description(p))
+
+    def _display_slug(slugs: list[str]) -> str:
+        # Prefer the plugin-qualified form (Claude Code's canonical install
+        # identifier); fall back to the bare name when none exists.
+        plugin_form = sorted(s for s in slugs if ":" in s)
+        return plugin_form[0] if plugin_form else sorted(slugs)[0]
+
+    # Cheapest-to-drop = least-used, then largest description.
+    ranked_paths = sorted(
+        per_path.items(),
+        key=lambda kv: (kv[1]["usage"], -kv[1]["desc_chars"]),
+    )
+    worst = [_display_slug(entry["slugs"]) for _, entry in ranked_paths[:5]]
 
     key = _key("skill-budget", "overall")
     if _is_dismissed(db_path, key):

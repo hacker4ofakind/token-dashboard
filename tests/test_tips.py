@@ -223,6 +223,20 @@ def _make_skill(root: Path, name: str, description: str, body: str = "Body text.
     return md
 
 
+def _make_plugin_skill(plugins_root: Path, plugin: str, name: str, description: str) -> Path:
+    """Write a SKILL.md under a marketplaces-style plugin path:
+       plugins_root/marketplaces/m/plugins/<plugin>/skills/<name>/SKILL.md
+    """
+    d = plugins_root / "marketplaces" / "m" / "plugins" / plugin / "skills" / name
+    d.mkdir(parents=True, exist_ok=True)
+    md = d / "SKILL.md"
+    md.write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\nBody text.\n",
+        encoding="utf-8",
+    )
+    return md
+
+
 class SkillListingBudgetTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -263,6 +277,43 @@ class SkillListingBudgetTests(unittest.TestCase):
         self.assertEqual(t["severity"], "warning")
         hrefs = [l["href"] for l in t["links"]]
         self.assertIn("#/skills", hrefs)
+
+    def test_plugin_skill_appears_once_in_candidates(self):
+        """Regression: a plugin SKILL.md registers two slugs (bare + <plugin>:<bare>).
+        The 'Least-recently-used candidates' list must dedupe by file path and
+        prefer the plugin-qualified form for display.
+        """
+        long_desc = "y" * 400
+        # One plugin skill with two slugs registered (bare + plugin form).
+        _make_plugin_skill(
+            self.skills_root / "plugins", "buzzwoo-ecom-shopware",
+            "shopware-app-system", long_desc,
+        )
+        # Plus a few plain skills to push us over budget.
+        for i in range(3):
+            _make_skill(self.skills_root, f"filler{i}", long_desc)
+
+        # Patch _DEFAULT_ROOTS to scan both the user-skills and plugins roots.
+        from token_dashboard import skills as s
+        with mock.patch.object(s, "_DEFAULT_ROOTS",
+                               [self.skills_root / "skills",
+                                self.skills_root / "plugins"]):
+            s._cache = {"at": 0.0, "data": {}, "key": None}
+            tips = skill_listing_budget_tips(
+                self.db, today_iso="2026-04-19T00:00:00", budget_chars=800,
+            )
+
+        self.assertTrue(tips)
+        body = tips[0]["body"]
+        # Plugin-qualified form should be the display label (not the bare form).
+        self.assertIn("buzzwoo-ecom-shopware:shopware-app-system", body)
+        # Bare slug must NOT also appear in the list (would be a duplicate).
+        before_period = body.split(":", 1)[1] if ":" in body else body
+        candidates_section = body.split("candidates:", 1)[-1]
+        self.assertEqual(
+            candidates_section.count("shopware-app-system"), 1,
+            "Plugin skill must appear exactly once in candidates list",
+        )
 
 
 class ClaudeMdSizeTests(unittest.TestCase):
