@@ -2,7 +2,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from token_dashboard import skills as _skills_mod
 from token_dashboard.skills import (
     scan_catalog,
     _slugs_for,
@@ -128,7 +130,12 @@ class CatalogTests(unittest.TestCase):
         outer.mkdir(parents=True)
         inner.mkdir(parents=True)
         roots = _project_skill_roots_from_cwds([str(self.tmp / "outer" / "inner" / "src")])
-        self.assertEqual(roots, [inner])
+        # Each root now carries scope + project_path so downstream tips can
+        # reason about which sessions actually load it.
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0]["root"], inner)
+        self.assertEqual(roots[0]["scope"], "project-local")
+        self.assertEqual(roots[0]["project_path"], str(self.tmp / "outer" / "inner"))
 
     def test_project_skill_roots_dedupes_across_cwds(self):
         root = self.tmp / "repo" / ".claude" / "skills"
@@ -138,7 +145,9 @@ class CatalogTests(unittest.TestCase):
             str(self.tmp / "repo" / "tests" / "unit"),
         ]
         roots = _project_skill_roots_from_cwds(cwds)
-        self.assertEqual(roots, [root])
+        self.assertEqual(len(roots), 1)
+        self.assertEqual(roots[0]["root"], root)
+        self.assertEqual(roots[0]["project_path"], str(self.tmp / "repo"))
 
     def test_cached_catalog_includes_project_local_from_db(self):
         # Reset the module-level cache so this test doesn't inherit neighbour state.
@@ -160,9 +169,261 @@ class CatalogTests(unittest.TestCase):
             )
             c.commit()
 
-        cat = cached_catalog(db_path)
+        # Neutralise the dev machine's real installed_plugins.json so we only
+        # observe the project-local skill discovery path under test.
+        with mock.patch.object(_skills_mod, "_default_roots", lambda: []):
+            cat = cached_catalog(db_path)
         self.assertIn("repo-skill", cat)
         self.assertEqual(cat["repo-skill"]["tokens"], 100)
+        # The project-local skill must be tagged with its project_path so
+        # downstream tips can reason about scope.
+        self.assertEqual(cat["repo-skill"]["scope"], "project-local")
+        self.assertEqual(cat["repo-skill"]["project_path"], str(project))
+
+
+class ManifestParsingTests(unittest.TestCase):
+    """`_read_installed_plugin_entries` -- the Phase 1 source of truth."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _write_manifest(self, payload: str) -> Path:
+        m = self.tmp / "installed_plugins.json"
+        m.write_text(payload, encoding="utf-8")
+        return m
+
+    def test_parses_user_scope_entry(self):
+        from token_dashboard.skills import _read_installed_plugin_entries
+        m = self._write_manifest('''
+        {"version": 2, "plugins": {
+          "foo@m": [{"installPath": "/some/path", "scope": "user",
+                     "projectPath": "/home/u"}]
+        }}''')
+        entries = _read_installed_plugin_entries(m)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["scope"], "user")
+        self.assertEqual(entries[0]["project_path"], "/home/u")
+
+    def test_parses_multiple_entries_per_plugin(self):
+        # Same plugin can be installed twice: once scope=user, once scope=project.
+        from token_dashboard.skills import _read_installed_plugin_entries
+        m = self._write_manifest('''
+        {"version": 2, "plugins": {
+          "foo@m": [
+            {"installPath": "/path/a", "scope": "user"},
+            {"installPath": "/path/b", "scope": "project",
+             "projectPath": "/repo/x"}
+          ]
+        }}''')
+        entries = _read_installed_plugin_entries(m)
+        self.assertEqual(len(entries), 2)
+        scopes = {e["scope"] for e in entries}
+        self.assertEqual(scopes, {"user", "project"})
+
+    def test_missing_file_returns_none(self):
+        # None signals "unreadable / broken" → caller falls back to legacy scan.
+        # Distinct from a valid-but-empty manifest (which returns []).
+        from token_dashboard.skills import _read_installed_plugin_entries
+        self.assertIsNone(_read_installed_plugin_entries(self.tmp / "absent.json"))
+
+    def test_malformed_json_returns_none(self):
+        from token_dashboard.skills import _read_installed_plugin_entries
+        m = self._write_manifest("{not valid json")
+        self.assertIsNone(_read_installed_plugin_entries(m))
+
+    def test_corrupt_utf8_returns_none(self):
+        # UnicodeDecodeError is a ValueError subclass; must be caught.
+        from token_dashboard.skills import _read_installed_plugin_entries
+        m = self.tmp / "installed_plugins.json"
+        m.write_bytes(b"\xff\xfe\x00invalid utf8 sequence")
+        self.assertIsNone(_read_installed_plugin_entries(m))
+
+    def test_valid_empty_manifest_returns_empty_list(self):
+        # A user with zero installed plugins is a legitimate state, NOT a
+        # fallback signal. _default_roots must NOT add the legacy blanket
+        # root for this case — otherwise marketplace clones get re-included.
+        from token_dashboard.skills import _read_installed_plugin_entries
+        m = self._write_manifest('{"version": 2, "plugins": {}}')
+        self.assertEqual(_read_installed_plugin_entries(m), [])
+
+    def test_entry_without_install_path_skipped(self):
+        from token_dashboard.skills import _read_installed_plugin_entries
+        m = self._write_manifest('''
+        {"version": 2, "plugins": {
+          "x@m": [{"scope": "user"}]
+        }}''')
+        self.assertEqual(_read_installed_plugin_entries(m), [])
+
+    def test_project_scope_without_project_path_degrades_to_user(self):
+        # Without a projectPath, is_active_in_cwd would short-circuit to False
+        # for every cwd — silently making the skill invisible to budget /
+        # dead-skills tips. Degrade to scope=user so it's at least counted.
+        from token_dashboard.skills import _read_installed_plugin_entries
+        m = self._write_manifest('''
+        {"version": 2, "plugins": {
+          "x@m": [{"installPath": "/some/path", "scope": "project"}]
+        }}''')
+        entries = _read_installed_plugin_entries(m)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["scope"], "user")
+
+
+class DefaultRootsResolutionTests(unittest.TestCase):
+    """`_default_roots` -- ties manifest entries to scoped roots."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _manifest(self, payload: str) -> Path:
+        m = self.tmp / "installed_plugins.json"
+        m.write_text(payload, encoding="utf-8")
+        return m
+
+    def test_manifest_drives_active_roots(self):
+        from token_dashboard.skills import _default_roots
+        m = self._manifest('''
+        {"version": 2, "plugins": {
+          "foo@m": [{"installPath": "/x/foo", "scope": "user"}],
+          "bar@m": [{"installPath": "/x/bar", "scope": "project",
+                     "projectPath": "/repo/y"}]
+        }}''')
+        roots = _default_roots(m)
+        # Two user-skills/scheduled-tasks roots + 2 plugin roots = 4 entries.
+        plugin_roots = [r for r in roots if "/x/" in str(r["root"]).replace("\\", "/")]
+        self.assertEqual(len(plugin_roots), 2)
+        foo = next(r for r in plugin_roots if "foo" in str(r["root"]))
+        bar = next(r for r in plugin_roots if "bar" in str(r["root"]))
+        self.assertEqual(foo["scope"], "user-global")
+        self.assertEqual(bar["scope"], "project-global")
+        self.assertEqual(bar["project_path"], "/repo/y")
+
+    def test_missing_manifest_falls_back_to_legacy_blanket_scan(self):
+        from token_dashboard.skills import _default_roots, _LEGACY_PLUGINS_ROOT
+        roots = _default_roots(self.tmp / "absent.json")
+        # Legacy fallback adds the blanket plugins root tagged 'unknown'.
+        legacy = [r for r in roots if r["root"] == _LEGACY_PLUGINS_ROOT]
+        self.assertEqual(len(legacy), 1)
+        self.assertEqual(legacy[0]["scope"], "unknown")
+
+    def test_valid_empty_manifest_does_NOT_trigger_legacy_fallback(self):
+        # Regression guard for the Phase 1 promise: user has uninstalled all
+        # plugins. Marketplace clones still exist on disk under ~/.claude/
+        # plugins/ but must stay excluded — otherwise the catalog re-pollutes.
+        from token_dashboard.skills import _default_roots, _LEGACY_PLUGINS_ROOT
+        m = self.tmp / "installed_plugins.json"
+        m.write_text('{"version": 2, "plugins": {}}', encoding="utf-8")
+        roots = _default_roots(m)
+        legacy = [r for r in roots if r["root"] == _LEGACY_PLUGINS_ROOT]
+        self.assertEqual(legacy, [],
+                         "Empty manifest must NOT trigger legacy blanket scan")
+
+
+class CatalogFilteringTests(unittest.TestCase):
+    """End-to-end: a SKILL.md outside any installed plugin must NOT be cataloged."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def test_marketplace_clone_outside_install_paths_excluded(self):
+        # Two SKILL.md files: one under an installed plugin, one orphaned in
+        # the marketplaces clone area (not in installed_plugins.json).
+        installed = self.tmp / "cache" / "m" / "installed-plugin" / "1.0" / "skills" / "in" / "SKILL.md"
+        installed.parent.mkdir(parents=True)
+        installed.write_text("y" * 200, encoding="utf-8")
+
+        clone = self.tmp / "marketplaces" / "m" / "plugins" / "uninstalled" / "skills" / "out" / "SKILL.md"
+        clone.parent.mkdir(parents=True)
+        clone.write_text("z" * 200, encoding="utf-8")
+
+        manifest = self.tmp / "installed_plugins.json"
+        manifest.write_text(f'''
+        {{"version": 2, "plugins": {{
+          "installed-plugin@m": [{{"installPath": "{installed.parent.parent.parent.as_posix()}",
+                                    "scope": "user"}}]
+        }}}}''', encoding="utf-8")
+
+        from token_dashboard.skills import scan_catalog, _default_roots
+        roots = _default_roots(manifest)
+        cat = scan_catalog(roots)
+        self.assertIn("in", cat)
+        self.assertNotIn("out", cat)
+        self.assertEqual(cat["in"]["scope"], "user-global")
+
+    def test_project_scope_carries_project_path(self):
+        installed = self.tmp / "cache" / "m" / "p" / "1.0" / "skills" / "s" / "SKILL.md"
+        installed.parent.mkdir(parents=True)
+        installed.write_text("x" * 100, encoding="utf-8")
+
+        manifest = self.tmp / "installed_plugins.json"
+        manifest.write_text(f'''
+        {{"version": 2, "plugins": {{
+          "p@m": [{{"installPath": "{installed.parent.parent.parent.as_posix()}",
+                    "scope": "project", "projectPath": "/repo/r"}}]
+        }}}}''', encoding="utf-8")
+
+        from token_dashboard.skills import scan_catalog, _default_roots
+        cat = scan_catalog(_default_roots(manifest))
+        self.assertEqual(cat["s"]["scope"], "project-global")
+        self.assertEqual(cat["s"]["project_path"], "/repo/r")
+
+
+class SafeScanRootTests(unittest.TestCase):
+    """`_safe_scan_root` -- bounds-check to prevent rglob DoS via tampered
+    installPath."""
+
+    def test_normal_path_is_accepted(self):
+        from token_dashboard.skills import _safe_scan_root
+        inside = Path.home() / ".claude" / "skills"
+        result = _safe_scan_root(inside)
+        self.assertIsNotNone(result)
+
+    def test_filesystem_root_is_rejected(self):
+        # A tampered manifest with installPath="/" or "C:\\" must not start
+        # an rglob walk of the entire filesystem — that's a self-DoS.
+        from token_dashboard.skills import _safe_scan_root
+        roots = [Path("/"), Path("C:\\")] if os.name == "nt" else [Path("/")]
+        for r in roots:
+            self.assertIsNone(_safe_scan_root(r),
+                              f"{r} should be rejected as a scan root")
+
+    def test_paths_outside_home_are_accepted(self):
+        # Users may legitimately keep projects outside their home (e.g.
+        # /opt/proj on POSIX, D:\repos on Windows). Don't reject those.
+        from token_dashboard.skills import _safe_scan_root
+        candidate = Path("/opt/proj") if os.name != "nt" else Path("D:\\repos")
+        # We don't require these to exist on disk; _safe_scan_root only
+        # validates structure. is_dir() is checked separately by scan_catalog.
+        self.assertIsNotNone(_safe_scan_root(candidate))
+
+
+class ActiveInCwdTests(unittest.TestCase):
+    def test_user_global_always_active(self):
+        from token_dashboard.skills import is_active_in_cwd
+        self.assertTrue(is_active_in_cwd("user-global", None, None))
+        self.assertTrue(is_active_in_cwd("user-global", None, "/anything"))
+
+    def test_unknown_treated_as_active(self):
+        from token_dashboard.skills import is_active_in_cwd
+        self.assertTrue(is_active_in_cwd("unknown", None, None))
+
+    def test_project_scope_active_under_project_path(self):
+        from token_dashboard.skills import is_active_in_cwd
+        tmp = Path(tempfile.mkdtemp())
+        sub = tmp / "src" / "deep"
+        sub.mkdir(parents=True)
+        self.assertTrue(is_active_in_cwd("project-global", str(tmp), str(sub)))
+        self.assertTrue(is_active_in_cwd("project-local", str(tmp), str(tmp)))
+
+    def test_project_scope_inactive_outside_project_path(self):
+        from token_dashboard.skills import is_active_in_cwd
+        tmp = Path(tempfile.mkdtemp())
+        other = Path(tempfile.mkdtemp())
+        self.assertFalse(is_active_in_cwd("project-global", str(tmp), str(other)))
+
+    def test_project_scope_without_cwd_is_inactive(self):
+        from token_dashboard.skills import is_active_in_cwd
+        self.assertFalse(is_active_in_cwd("project-global", "/foo", None))
+        self.assertFalse(is_active_in_cwd("project-global", None, "/foo"))
 
 
 if __name__ == "__main__":

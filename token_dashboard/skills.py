@@ -9,21 +9,51 @@ A skill on disk lives at one of:
 
 Sizes are in chars; token estimate is chars // 4 (the same approximation
 `scanner._extract_results` uses for tool-result tokens).
+
+Active-set filtering
+--------------------
+`~/.claude/plugins/installed_plugins.json` is Claude Code's source of truth
+for which plugins are actually loaded. Plenty of SKILL.md files live on disk
+under `~/.claude/plugins/` as marketplace clones (downloaded metadata) without
+ever being installed -- they don't consume context and shouldn't show up in
+budget tips. We honour the manifest: only plugin paths listed there contribute
+to the catalog.
+
+Each catalog entry carries its scope so callers can reason about per-context
+activity:
+  scope="user-global"     -> active in every session (user-skills, scheduled-
+                             tasks, scope=user manifest entries)
+  scope="project-global"  -> active only when cwd is under project_path
+                             (manifest scope=project entries)
+  scope="project-local"   -> active only when cwd is under project_path
+                             (cwd/.claude/skills/ discovered from DB cwds)
+  scope="unknown"         -> legacy fallback when manifest is missing/unreadable;
+                             treated as user-global by active-set helpers
 """
 from __future__ import annotations
 
+import json
+import re
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional
 
+
+_USER_SKILLS_ROOT = Path.home() / ".claude" / "skills"
+_SCHEDULED_TASKS_ROOT = Path.home() / ".claude" / "scheduled-tasks"
+_PLUGINS_MANIFEST = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+_LEGACY_PLUGINS_ROOT = Path.home() / ".claude" / "plugins"
+
+
+# Legacy module-level roots kept for backward compatibility with tests that
+# monkey-patch this list. Production code goes through `_default_roots()`
+# instead, which honours the installed_plugins.json manifest.
 _DEFAULT_ROOTS = [
-    Path.home() / ".claude" / "skills",
-    Path.home() / ".claude" / "scheduled-tasks",
-    Path.home() / ".claude" / "plugins",
+    _USER_SKILLS_ROOT,
+    _SCHEDULED_TASKS_ROOT,
+    _LEGACY_PLUGINS_ROOT,
 ]
 
-
-import re
 
 _VERSION_RE = re.compile(r"^\d+\.\d+")
 _STRUCTURE_NAMES = {"skills", "plugins", "marketplaces", "cache", ".claude"}
@@ -125,23 +155,192 @@ def _slugs_for(skill_md: Path) -> list[str]:
     return sorted(slugs)
 
 
-def scan_catalog(roots=None) -> Dict[str, dict]:
-    """Return {slug: {path, chars, tokens}} for every SKILL.md found.
+# ── Active-roots resolution ──────────────────────────────────────────────────
 
-    When a slug resolves to multiple files (nested `skills/skills/`), keep the
-    entry with the shallowest path — that's the canonical install.
+
+def _read_installed_plugin_entries(
+    manifest_path: Optional[Path] = None,
+) -> Optional[List[dict]]:
+    """Read installed_plugins.json and return active-plugin metadata.
+
+    Returns ``[]`` for a *valid-but-empty* manifest (user has no plugins
+    installed -- legitimate state, not a fallback condition). Returns
+    ``None`` when the manifest is missing, unreadable, or structurally
+    broken -- callers should distinguish these because the empty case must
+    NOT trigger a legacy blanket scan (that would re-introduce marketplace
+    clones we explicitly want excluded).
+
+    ``ValueError`` covers both ``json.JSONDecodeError`` (malformed JSON) and
+    ``UnicodeDecodeError`` (corrupt byte sequences) -- both are subclasses
+    of ``ValueError``.
+
+    The manifest schema (Claude Code v2) is::
+
+        {
+          "version": 2,
+          "plugins": {
+            "<plugin>@<marketplace>": [
+              {"installPath": "...", "scope": "user"|"project",
+               "projectPath": "...", ...},
+              ...
+            ]
+          }
+        }
+
+    The same plugin can appear with multiple entries (e.g. once with
+    scope=user and again with scope=project for a specific repo). We return
+    every entry so callers can preserve the scope semantics for each install.
     """
-    roots = roots or _DEFAULT_ROOTS
+    path = manifest_path or _PLUGINS_MANIFEST
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    plugins = data.get("plugins", {})
+    if not isinstance(plugins, dict):
+        return None
+    out: List[dict] = []
+    for entries in plugins.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            ip = entry.get("installPath")
+            if not ip:
+                continue
+            scope = entry.get("scope", "user")
+            project_path = entry.get("projectPath")
+            # Defensive: a scope=project entry without projectPath would be
+            # invisible to is_active_in_cwd (no path to compare against).
+            # Claude Code loads such plugins in every session, so degrade to
+            # scope=user rather than silently dropping the skill from budget
+            # and dead-skills reasoning.
+            if scope == "project" and not project_path:
+                scope = "user"
+            out.append({
+                "install_path": Path(ip),
+                "scope": scope,
+                "project_path": project_path,
+            })
+    return out
+
+
+def _default_roots(
+    manifest_path: Optional[Path] = None,
+) -> List[dict]:
+    """Return ``[{root, scope, project_path}, ...]`` for currently-installed skill roots.
+
+    Sources, in order:
+      1. ``~/.claude/skills/``           — scope=user-global
+      2. ``~/.claude/scheduled-tasks/``  — scope=user-global
+      3. Every ``installPath`` from ``installed_plugins.json``, tagged with
+         scope=user-global (for scope=user entries) or scope=project-global
+         (for scope=project entries, carrying projectPath).
+      4. Legacy fallback when the manifest is missing or empty:
+         ``~/.claude/plugins/`` blanket-scanned with scope=unknown.
+
+    The unknown-scope fallback preserves pre-manifest behaviour on installs
+    that don't yet write the JSON file. Active-set helpers treat unknown as
+    user-global so the tip still fires; it just can't differentiate scopes.
+    """
+    roots: List[dict] = [
+        {"root": _USER_SKILLS_ROOT, "scope": "user-global", "project_path": None},
+        {"root": _SCHEDULED_TASKS_ROOT, "scope": "user-global", "project_path": None},
+    ]
+    entries = _read_installed_plugin_entries(manifest_path)
+    if entries is None:
+        # Manifest missing/unreadable/structurally broken → legacy blanket
+        # scan so the dashboard still works on installs without the JSON
+        # manifest. A user-uninstall-everything state returns [] (not None)
+        # and correctly skips this fallback.
+        roots.append({
+            "root": _LEGACY_PLUGINS_ROOT,
+            "scope": "unknown",
+            "project_path": None,
+        })
+    else:
+        for e in entries:
+            scope = "user-global" if e["scope"] == "user" else "project-global"
+            roots.append({
+                "root": e["install_path"],
+                "scope": scope,
+                "project_path": e["project_path"],
+            })
+    return roots
+
+
+def _safe_scan_root(root: Path) -> Optional[Path]:
+    """Resolve a root and reject obviously-unsafe scan starting points.
+
+    A misbehaving plugin installer (or a tampered manifest) could set
+    ``installPath`` to ``/`` or ``C:\\``. ``Path.rglob`` would then walk the
+    entire filesystem, stalling every tip endpoint for the duration. Reject
+    any path whose resolved form is a filesystem root (no parent except
+    itself) -- this eliminates the DoS surface without restricting legitimate
+    project locations outside the user's home (e.g. ``D:\\repos\\foo``).
+
+    Returns the resolved Path on success, or None when the root is unsafe
+    or unresolvable -- callers should skip silently.
+    """
+    try:
+        resolved = root.resolve(strict=False)
+    except OSError:
+        return None
+    # A filesystem root has the property `parent == self`.
+    if resolved.parent == resolved:
+        return None
+    return resolved
+
+
+def _normalise_roots(roots) -> List[dict]:
+    """Accept either bare Paths (legacy) or root-dicts and return root-dicts.
+
+    Bare-path entries get scope='unknown' / project_path=None — that's the
+    historical "no scope information" baseline.
+    """
+    norm: List[dict] = []
+    for r in roots:
+        if isinstance(r, dict):
+            norm.append(r)
+        else:
+            norm.append({"root": Path(r), "scope": "unknown", "project_path": None})
+    return norm
+
+
+def scan_catalog(roots=None) -> Dict[str, dict]:
+    """Return ``{slug: {path, chars, tokens, scope, project_path}}`` for every SKILL.md.
+
+    ``roots`` accepts either:
+      - ``None`` — uses ``_default_roots()`` (production path).
+      - A list of ``Path`` — legacy form; all matches tagged scope='unknown'.
+      - A list of ``{root, scope, project_path}`` dicts — explicit scope tagging.
+
+    When a slug resolves to multiple files (nested ``skills/skills/``), keep
+    the entry with the shallowest path — that's the canonical install.
+    """
+    if roots is None:
+        roots = _default_roots()
+    norm = _normalise_roots(roots)
     catalog: Dict[str, dict] = {}
-    for root in roots:
-        if not root.is_dir():
+    for spec in norm:
+        root = _safe_scan_root(spec["root"])
+        if root is None or not root.is_dir():
             continue
         for md in root.rglob("SKILL.md"):
             try:
                 chars = md.stat().st_size
             except OSError:
                 continue
-            entry = {"path": str(md), "chars": chars, "tokens": chars // 4}
+            entry = {
+                "path": str(md),
+                "chars": chars,
+                "tokens": chars // 4,
+                "scope": spec["scope"],
+                "project_path": spec["project_path"],
+            }
             for slug in _slugs_for(md):
                 prev = catalog.get(slug)
                 if prev is None or len(md.parts) < len(Path(prev["path"]).parts):
@@ -149,13 +348,15 @@ def scan_catalog(roots=None) -> Dict[str, dict]:
     return catalog
 
 
-def _project_skill_roots_from_cwds(cwds: Iterable[str]) -> list[Path]:
-    """Return the innermost `.claude/skills/` directory for each cwd.
+def _project_skill_roots_from_cwds(cwds: Iterable[str]) -> List[dict]:
+    """Return root-dicts for the innermost ``.claude/skills/`` per cwd.
 
     Matches Claude Code's resolution rule: walk up from cwd and use the first
-    `.claude/skills/` found, so a nested repo uses its own skills, not a parent's.
+    ``.claude/skills/`` found, so a nested repo uses its own skills, not a
+    parent's. Each discovered root is tagged scope='project-local' with
+    project_path = the directory that contains the ``.claude/`` folder.
     """
-    roots: set[Path] = set()
+    seen: dict[Path, dict] = {}
     for cwd in cwds:
         if not cwd:
             continue
@@ -163,9 +364,14 @@ def _project_skill_roots_from_cwds(cwds: Iterable[str]) -> list[Path]:
         for ancestor in (p, *p.parents):
             candidate = ancestor / ".claude" / "skills"
             if candidate.is_dir():
-                roots.add(candidate)
+                if candidate not in seen:
+                    seen[candidate] = {
+                        "root": candidate,
+                        "scope": "project-local",
+                        "project_path": str(ancestor),
+                    }
                 break
-    return sorted(roots)
+    return [seen[k] for k in sorted(seen)]
 
 
 def _cwds_from_db(db_path) -> list[str]:
@@ -176,6 +382,37 @@ def _cwds_from_db(db_path) -> list[str]:
         )]
 
 
+def is_active_in_cwd(
+    scope: str,
+    project_path: Optional[str],
+    cwd: Optional[str],
+) -> bool:
+    """True if a skill with this scope/project_path is loaded when working in cwd.
+
+    Rules:
+      * ``user-global`` and ``unknown`` are always active.
+      * ``project-global`` and ``project-local`` are active only when cwd is
+        equal to project_path or a descendant of it.
+      * Missing project_path or cwd defaults to inactive for project-scoped
+        skills (caller must supply cwd to evaluate them).
+
+    Comparison uses ``Path.relative_to`` against the resolved paths so that
+    different separators / trailing slashes / case normalisation (Windows)
+    don't break the check.
+    """
+    if scope in ("user-global", "unknown"):
+        return True
+    if scope in ("project-global", "project-local"):
+        if not project_path or not cwd:
+            return False
+        try:
+            Path(cwd).resolve().relative_to(Path(project_path).resolve())
+            return True
+        except (OSError, ValueError):
+            return False
+    return False
+
+
 _cache: dict = {"at": 0.0, "data": {}, "key": None}
 _TTL_SECONDS = 60.0
 
@@ -183,14 +420,16 @@ _TTL_SECONDS = 60.0
 def cached_catalog(db_path=None) -> Dict[str, dict]:
     """scan_catalog() with a simple in-process TTL cache.
 
-    When `db_path` is provided, extra roots are derived from the distinct cwds
-    in `messages` so project-local `.claude/skills/` directories are included.
+    When ``db_path`` is provided, extra roots are derived from the distinct
+    cwds in ``messages`` so project-local ``.claude/skills/`` directories are
+    included (tagged scope='project-local').
     """
     now = time.time()
     key = str(db_path) if db_path else None
     if now - _cache["at"] > _TTL_SECONDS or _cache["key"] != key:
+        base = _default_roots()
         extra = _project_skill_roots_from_cwds(_cwds_from_db(db_path)) if db_path else []
-        _cache["data"] = scan_catalog(_DEFAULT_ROOTS + extra)
+        _cache["data"] = scan_catalog(base + extra)
         _cache["at"] = now
         _cache["key"] = key
     return _cache["data"]

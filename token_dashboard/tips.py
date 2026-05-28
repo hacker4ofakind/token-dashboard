@@ -313,9 +313,28 @@ def _read_skill_description(path: str) -> str:
 _SKILL_BUDGET_CHARS = 8000
 
 
+def _most_active_cwd(db_path, since_iso: str) -> Optional[str]:
+    """Return the cwd with the most messages since `since_iso`, or None."""
+    with connect(db_path) as c:
+        row = c.execute(
+            """SELECT cwd, COUNT(*) AS n FROM messages
+                WHERE cwd IS NOT NULL AND cwd != '' AND timestamp >= ?
+                GROUP BY cwd ORDER BY n DESC LIMIT 1""",
+            (since_iso,),
+        ).fetchone()
+    return row["cwd"] if row else None
+
+
 def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
                               budget_chars: int = _SKILL_BUDGET_CHARS) -> List[dict]:
     """Flag installed skills whose description footprint exceeds the listing budget.
+
+    Scope-aware: the catalog now distinguishes user-global skills (loaded in
+    every session) from project-scoped ones (loaded only when working under a
+    specific project path). We compute the *effective* per-session footprint
+    by intersecting the catalog with the user's most-active recent cwd — this
+    matches what Claude Code actually loads when the user fires up a session
+    in that project.
 
     Cross-references the on-disk skill catalog (descriptions) with
     invocation counts from `tool_calls` so the worst offenders (unused or
@@ -324,18 +343,35 @@ def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
     today_iso = today_iso or datetime.utcnow().isoformat()
     since = _iso_days_ago(today_iso, 30)
 
-    from .skills import cached_catalog
+    from .skills import cached_catalog, is_active_in_cwd
     catalog = cached_catalog(db_path)
     if not catalog:
         return []
 
-    # Aggregate per slug. A SKILL.md may register multiple slugs (bare + plugin:bare).
-    # Dedup by path so we count each file's description once.
-    seen_paths: dict[str, int] = {}
-    for info in catalog.values():
-        seen_paths[info["path"]] = len(_read_skill_description(info["path"]))
-    total_chars = sum(seen_paths.values())
-    if total_chars <= budget_chars:
+    top_cwd = _most_active_cwd(db_path, since)
+
+    # Group slugs by the SKILL.md they resolve to: a single file commonly
+    # registers two slugs (bare + "<plugin>:<bare>"). Each path is one skill
+    # and must be counted once regardless of how many slug aliases it has.
+    per_path: dict[str, dict] = {}
+    for slug, info in catalog.items():
+        entry = per_path.setdefault(info["path"], {
+            "slugs": [],
+            "scope": info["scope"],
+            "project_path": info["project_path"],
+        })
+        entry["slugs"].append(slug)
+    for p, entry in per_path.items():
+        entry["desc_chars"] = len(_read_skill_description(p))
+        entry["active_here"] = is_active_in_cwd(
+            entry["scope"], entry["project_path"], top_cwd,
+        )
+
+    # Effective footprint = sum of descriptions for skills active in the
+    # most-active cwd. That's what consumes Claude Code's per-session budget.
+    active_paths = {p: e for p, e in per_path.items() if e["active_here"]}
+    effective_chars = sum(e["desc_chars"] for e in active_paths.values())
+    if effective_chars <= budget_chars:
         return []
 
     with connect(db_path) as c:
@@ -348,16 +384,8 @@ def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
             (since,),
         )}
 
-    # Group slugs by the SKILL.md they resolve to: a single file commonly
-    # registers two slugs (bare + "<plugin>:<bare>"), and the ranking must not
-    # double-count it or pollute the candidates list with two display lines.
-    per_path: dict[str, dict] = {}
-    for slug, info in catalog.items():
-        entry = per_path.setdefault(info["path"], {"slugs": [], "usage": 0})
-        entry["slugs"].append(slug)
-        entry["usage"] += used.get(slug, 0)
-    for p, entry in per_path.items():
-        entry["desc_chars"] = len(_read_skill_description(p))
+    for p, entry in active_paths.items():
+        entry["usage"] = sum(used.get(s, 0) for s in entry["slugs"])
 
     def _display_slug(slugs: list[str]) -> str:
         # Prefer the plugin-qualified form (Claude Code's canonical install
@@ -365,9 +393,11 @@ def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
         plugin_form = sorted(s for s in slugs if ":" in s)
         return plugin_form[0] if plugin_form else sorted(slugs)[0]
 
-    # Cheapest-to-drop = least-used, then largest description.
+    # Cheapest-to-drop = least-used, then largest description. Only consider
+    # skills active in the current context — uninstalling a skill that isn't
+    # even loaded here wouldn't help this session's budget.
     ranked_paths = sorted(
-        per_path.items(),
+        active_paths.items(),
         key=lambda kv: (kv[1]["usage"], -kv[1]["desc_chars"]),
     )
     worst = [_display_slug(entry["slugs"]) for _, entry in ranked_paths[:5]]
@@ -376,15 +406,42 @@ def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
     if _is_dismissed(db_path, key):
         return []
 
-    over_pct = (total_chars / budget_chars - 1) * 100
-    body = (
-        f"Installed skill descriptions total ~{total_chars:,} chars vs the default "
-        f"~{budget_chars:,}-char budget (1% of context). Claude Code drops descriptions "
-        "of the least-used skills first, so those skills stop auto-triggering. "
-        f"Least-recently-used candidates: {', '.join(worst)}."
-        if worst else
-        f"Installed skill descriptions total ~{total_chars:,} chars vs ~{budget_chars:,}."
-    )
+    over_pct = (effective_chars / budget_chars - 1) * 100
+
+    # Compose scope summary. When the manifest is missing (all scope='unknown'),
+    # skip the breakdown — we can't differentiate honestly.
+    n_user = sum(1 for e in active_paths.values() if e["scope"] == "user-global")
+    n_proj = sum(1 for e in active_paths.values() if e["scope"] in ("project-global", "project-local"))
+    n_unknown = sum(1 for e in active_paths.values() if e["scope"] == "unknown")
+    cwd_label = Path(top_cwd).name if top_cwd else None
+
+    scope_phrase = ""
+    if n_unknown == 0 and cwd_label and (n_proj or n_user):
+        if n_proj and n_user:
+            scope_phrase = (
+                f" In your most-active context (`{cwd_label}`), {n_user} global "
+                f"skill(s) plus {n_proj} project-scoped skill(s) load per session."
+            )
+        elif n_user:
+            scope_phrase = f" All {n_user} active skills are user-global (load in every session)."
+        elif n_proj:
+            scope_phrase = (
+                f" {n_proj} project-scoped skill(s) load when working in `{cwd_label}`."
+            )
+
+    if worst:
+        body = (
+            f"Skill descriptions loaded per session total ~{effective_chars:,} chars "
+            f"vs the default ~{budget_chars:,}-char budget (1% of context)."
+            f"{scope_phrase} Claude Code drops descriptions of the least-used "
+            "skills first, so those skills stop auto-triggering. "
+            f"Least-recently-used candidates: {', '.join(worst)}."
+        )
+    else:
+        body = (
+            f"Skill descriptions loaded per session total ~{effective_chars:,} chars "
+            f"vs ~{budget_chars:,}.{scope_phrase}"
+        )
     return [_make_tip(
         key=key, category="skill-budget", severity="warning",
         title=f"Skill-listing budget exceeded by ~{over_pct:.0f}%",
@@ -1037,13 +1094,18 @@ def dead_skills_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
 
     Skills installed in the last 30 days are excluded (file mtime as install-age
     proxy — same semantics on macOS, Linux, and Windows).
+
+    Project-scoped skills are excluded when their project hasn't been visited
+    in the 90-day window — "no invocations" is meaningless for a project the
+    user simply hasn't touched lately, and uninstalling it would break that
+    project the moment it's reopened.
     """
     today_iso = today_iso or datetime.utcnow().isoformat()
     since = _iso_days_ago(today_iso, _DEAD_SKILLS_WINDOW_DAYS)
     now = time.time()
     min_age = _DEAD_SKILLS_MIN_AGE_DAYS * 86400
 
-    from .skills import cached_catalog
+    from .skills import cached_catalog, is_active_in_cwd
     catalog = cached_catalog(db_path)
     if not catalog:
         return []
@@ -1055,18 +1117,40 @@ def dead_skills_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
                   AND timestamp >= ?""",
             (since,),
         )}
+        recent_cwds = [r["cwd"] for r in c.execute(
+            """SELECT DISTINCT cwd FROM messages
+                WHERE cwd IS NOT NULL AND cwd != '' AND timestamp >= ?""",
+            (since,),
+        )]
+
+    def _active_somewhere_recently(scope: Optional[str], project_path: Optional[str]) -> bool:
+        """True if the skill was loadable in at least one session in the window."""
+        if scope in ("user-global", "unknown"):
+            return True
+        if not recent_cwds:
+            # No session history at all → don't second-guess; treat as visited.
+            return True
+        return any(is_active_in_cwd(scope, project_path, cwd) for cwd in recent_cwds)
 
     # Group slugs by SKILL.md path so each file is judged once. A skill is dead
     # iff *none* of its registered slugs (bare and plugin-qualified) saw an
     # invocation.
-    per_path: dict[str, list[str]] = {}
+    per_path: dict[str, dict] = {}
     for slug, info in catalog.items():
-        per_path.setdefault(info["path"], []).append(slug)
+        entry = per_path.setdefault(info["path"], {
+            "slugs": [],
+            "scope": info["scope"],
+            "project_path": info["project_path"],
+        })
+        entry["slugs"].append(slug)
 
     dead: list[str] = []
-    for path, slugs in per_path.items():
+    for path, entry in per_path.items():
+        slugs = entry["slugs"]
         if any(s in used_slugs for s in slugs):
             continue
+        if not _active_somewhere_recently(entry["scope"], entry["project_path"]):
+            continue  # project-scoped + project not visited → can't conclude dead
         try:
             mtime = Path(path).stat().st_mtime
         except OSError:

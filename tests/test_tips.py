@@ -217,6 +217,40 @@ class DismissTests(unittest.TestCase):
         self.assertFalse(tips_after)
 
 
+def _fake_default_roots(*specs):
+    """Build a `_default_roots`-shaped function returning the given specs.
+
+    Each spec is either a bare ``Path`` (tagged scope='unknown') or a
+    ``(root, scope, project_path)`` tuple. Use this in tests to neutralise the
+    real `installed_plugins.json` manifest on the developer's machine — the
+    catalog leaks otherwise and pollutes assertions.
+    """
+    out = []
+    for s in specs:
+        if isinstance(s, tuple):
+            root, scope, project_path = s
+            out.append({"root": Path(root), "scope": scope,
+                        "project_path": project_path})
+        else:
+            out.append({"root": Path(s), "scope": "unknown", "project_path": None})
+    return lambda: out
+
+
+def _isolate_skill_catalog(fake_roots):
+    """Patch both catalog inputs so tests don't leak the dev-machine state.
+
+    Windows tempdirs live under the user's home (``C:\\Users\\<u>\\AppData\\...``)
+    which means a naive ancestor-walk for ``.claude/skills/`` will find the
+    real one. We patch `_project_skill_roots_from_cwds` to return [] so tests
+    see only the explicitly-provided roots.
+    """
+    from token_dashboard import skills as s
+    return [
+        mock.patch.object(s, "_default_roots", fake_roots),
+        mock.patch.object(s, "_project_skill_roots_from_cwds", lambda cwds: []),
+    ]
+
+
 def _make_skill(root: Path, name: str, description: str, body: str = "Body text.\n") -> Path:
     """Write a SKILL.md with frontmatter under root/skills/<name>/SKILL.md."""
     d = root / "skills" / name
@@ -251,11 +285,12 @@ class SkillListingBudgetTests(unittest.TestCase):
         self.skills_root = self.tmp / "fake_home" / ".claude"
         self.skills_root.mkdir(parents=True)
 
-    def _patch_roots(self):
-        # cached_catalog reads module-level _DEFAULT_ROOTS; patch + reset cache.
+    def _patch_roots(self, extra_roots=()):
+        # cached_catalog now reads `_default_roots()`; patch the function so the
+        # real installed_plugins.json manifest on the dev machine doesn't leak in.
         from token_dashboard import skills as s
-        return mock.patch.object(s, "_DEFAULT_ROOTS",
-                                 [self.skills_root / "skills"]), s
+        fake = _fake_default_roots(self.skills_root / "skills", *extra_roots)
+        return mock.patch.object(s, "_default_roots", fake), s
 
     def test_under_budget_no_tip(self):
         _make_skill(self.skills_root, "tiny", "short desc")
@@ -299,11 +334,13 @@ class SkillListingBudgetTests(unittest.TestCase):
         for i in range(3):
             _make_skill(self.skills_root, f"filler{i}", long_desc)
 
-        # Patch _DEFAULT_ROOTS to scan both the user-skills and plugins roots.
+        # Patch _default_roots to scan both the user-skills and plugins roots.
         from token_dashboard import skills as s
-        with mock.patch.object(s, "_DEFAULT_ROOTS",
-                               [self.skills_root / "skills",
-                                self.skills_root / "plugins"]):
+        fake = _fake_default_roots(
+            self.skills_root / "skills",
+            self.skills_root / "plugins",
+        )
+        with mock.patch.object(s, "_default_roots", fake):
             s._cache = {"at": 0.0, "data": {}, "key": None}
             tips = skill_listing_budget_tips(
                 self.db, today_iso="2026-04-19T00:00:00", budget_chars=800,
@@ -332,8 +369,8 @@ class DeadSkillsTests(unittest.TestCase):
 
     def _patch_roots(self):
         from token_dashboard import skills as s
-        return mock.patch.object(s, "_DEFAULT_ROOTS",
-                                 [self.skills_root / "skills"]), s
+        fake = _fake_default_roots(self.skills_root / "skills")
+        return mock.patch.object(s, "_default_roots", fake), s
 
     def _age_skill(self, path: Path, days: int) -> None:
         """Set mtime to `days` ago — used to bypass the 'recently installed' filter."""
@@ -873,6 +910,196 @@ class ClaudeMdStackTests(unittest.TestCase):
         self.assertFalse(tips)
 
 
+class SkillBudgetScopeAwarenessTests(unittest.TestCase):
+    """Phase 2 verification: budget tip reflects per-context effective footprint."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "t.db")
+        init_db(self.db)
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+
+    def _make_skill_at(self, root: Path, name: str, desc: str) -> Path:
+        d = root / name
+        d.mkdir(parents=True, exist_ok=True)
+        md = d / "SKILL.md"
+        md.write_text(f"---\nname: {name}\ndescription: {desc}\n---\nx\n",
+                      encoding="utf-8")
+        return md
+
+    def test_project_scoped_skills_excluded_when_user_in_other_project(self):
+        """Project-scoped skills loaded for repo-A must NOT count toward the
+        budget when the user's most-active cwd is repo-B."""
+        repo_a = self.tmp / "repos" / "a"
+        repo_b = self.tmp / "repos" / "b"
+        repo_a.mkdir(parents=True)
+        repo_b.mkdir(parents=True)
+        skills_a = self.tmp / "skills-a"
+        skills_a.mkdir()
+        # 5 skills × 400-char descriptions = 2000 chars — would exceed budget=800
+        for i in range(5):
+            self._make_skill_at(skills_a, f"a{i}", "x" * 400)
+
+        # Seed messages.cwd pointing to repo_b, not repo_a.
+        with connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, cwd)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                ("u1", "s1", "b", "user", "2026-04-15T00:00:00Z", str(repo_b)),
+            )
+            c.commit()
+
+        from token_dashboard import skills as s
+        fake = _fake_default_roots((skills_a, "project-global", str(repo_a)))
+        patches = _isolate_skill_catalog(fake)
+        for p in patches:
+            p.start()
+        try:
+            s._cache = {"at": 0.0, "data": {}, "key": None}
+            tips = skill_listing_budget_tips(
+                self.db, today_iso="2026-04-19T00:00:00", budget_chars=800,
+            )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        # The 5 skills are only loaded in repo_a; user works in repo_b → tip
+        # must not fire.
+        self.assertEqual(tips, [])
+
+    def test_user_global_skills_drive_budget_in_any_cwd(self):
+        skills = self.tmp / "user-skills"
+        skills.mkdir()
+        for i in range(5):
+            self._make_skill_at(skills, f"u{i}", "x" * 400)
+
+        with connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, cwd)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                ("u1", "s1", "anywhere", "user", "2026-04-15T00:00:00Z",
+                 str(self.tmp / "anywhere")),
+            )
+            c.commit()
+
+        from token_dashboard import skills as s
+        fake = _fake_default_roots((skills, "user-global", None))
+        patches = _isolate_skill_catalog(fake)
+        for p in patches:
+            p.start()
+        try:
+            s._cache = {"at": 0.0, "data": {}, "key": None}
+            tips = skill_listing_budget_tips(
+                self.db, today_iso="2026-04-19T00:00:00", budget_chars=800,
+            )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        self.assertTrue(tips)
+        # When all active skills are user-global, the body must say so —
+        # the user can't escape the cost by switching projects.
+        self.assertIn("user-global", tips[0]["body"])
+
+    def test_body_names_top_project_when_mixing_scopes(self):
+        repo = self.tmp / "repos" / "main-project"
+        repo.mkdir(parents=True)
+        proj_skills = self.tmp / "proj-skills"
+        proj_skills.mkdir()
+        user_skills = self.tmp / "user-skills"
+        user_skills.mkdir()
+        # 3 user-global + 3 project-global, each 400 chars.
+        for i in range(3):
+            self._make_skill_at(user_skills, f"u{i}", "x" * 400)
+            self._make_skill_at(proj_skills, f"p{i}", "y" * 400)
+
+        with connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, cwd)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                ("u1", "s1", "main", "user", "2026-04-15T00:00:00Z", str(repo)),
+            )
+            c.commit()
+
+        from token_dashboard import skills as s
+        fake = _fake_default_roots(
+            (user_skills, "user-global", None),
+            (proj_skills, "project-global", str(repo)),
+        )
+        patches = _isolate_skill_catalog(fake)
+        for p in patches:
+            p.start()
+        try:
+            s._cache = {"at": 0.0, "data": {}, "key": None}
+            tips = skill_listing_budget_tips(
+                self.db, today_iso="2026-04-19T00:00:00", budget_chars=800,
+            )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        self.assertTrue(tips)
+        body = tips[0]["body"]
+        # Body should name the project the user is most active in.
+        self.assertIn("main-project", body)
+        # And split the count between global vs project-scoped.
+        self.assertIn("3 global skill", body)
+        self.assertIn("3 project-scoped skill", body)
+
+
+class DeadSkillsScopeAwarenessTests(unittest.TestCase):
+    """Phase 2: project-scoped skills in unvisited projects aren't 'dead'."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db = str(self.tmp / "t.db")
+        init_db(self.db)
+
+    def _make(self, root: Path, name: str, desc: str = "x") -> Path:
+        d = root / name
+        d.mkdir(parents=True, exist_ok=True)
+        md = d / "SKILL.md"
+        md.write_text(f"---\nname: {name}\ndescription: {desc}\n---\n", encoding="utf-8")
+        old = os.path.getmtime(md) - 120 * 86400  # bypass new-install grace period
+        os.utime(md, (old, old))
+        return md
+
+    def test_unvisited_project_skills_not_counted_as_dead(self):
+        # 6 skills under repo_unvisited (project-scoped), zero invocations.
+        # User has only worked in repo_visited recently.
+        repo_unvisited = self.tmp / "unvisited"
+        repo_unvisited.mkdir()
+        repo_visited = self.tmp / "visited"
+        repo_visited.mkdir()
+        skills_root = self.tmp / "skills-unvisited"
+        skills_root.mkdir()
+        for i in range(6):
+            self._make(skills_root, f"dead{i}")
+
+        with connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, cwd)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                ("u1", "s1", "v", "user", "2026-05-15T00:00:00Z", str(repo_visited)),
+            )
+            c.commit()
+
+        from token_dashboard import skills as s
+        fake = _fake_default_roots(
+            (skills_root, "project-global", str(repo_unvisited))
+        )
+        patches = _isolate_skill_catalog(fake)
+        for p in patches:
+            p.start()
+        try:
+            s._cache = {"at": 0.0, "data": {}, "key": None}
+            tips = dead_skills_tips(self.db, today_iso="2026-05-19T00:00:00")
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        # Project-scoped to a repo the user hasn't visited in 90d → those
+        # zero-invocation counts are meaningless; tip must NOT flag them as dead.
+        self.assertEqual(tips, [])
+
+
 class LongSkillDescriptionsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -883,8 +1110,8 @@ class LongSkillDescriptionsTests(unittest.TestCase):
 
     def _patch_roots(self):
         from token_dashboard import skills as s
-        return mock.patch.object(s, "_DEFAULT_ROOTS",
-                                 [self.skills_root / "skills"]), s
+        fake = _fake_default_roots(self.skills_root / "skills")
+        return mock.patch.object(s, "_default_roots", fake), s
 
     def test_three_long_descriptions_flagged(self):
         for i in range(3):
