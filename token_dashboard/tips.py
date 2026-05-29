@@ -14,6 +14,7 @@ Tip dict shape:
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from datetime import datetime, timedelta
@@ -293,18 +294,77 @@ def outlier_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _DESC_RE = re.compile(r"^description:\s*(.+?)\s*$", re.MULTILINE)
+_DISABLE_MODEL_RE = re.compile(
+    r"^disable-model-invocation:\s*(true|yes|1)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_DESCRIPTION_HIDDEN_OVERRIDES = frozenset({"user-invocable-only", "name-only", "off"})
+_USER_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
 
-def _read_skill_description(path: str) -> str:
-    """Return the `description:` value from a SKILL.md frontmatter, or empty string."""
+def _read_skill_frontmatter(path: str) -> str:
     try:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
     m = _FRONTMATTER_RE.match(text)
-    block = m.group(1) if m else text[:2000]
+    return m.group(1) if m else text[:2000]
+
+
+def _read_skill_description(path: str) -> str:
+    """Return the `description:` value from a SKILL.md frontmatter, or empty string."""
+    block = _read_skill_frontmatter(path)
     d = _DESC_RE.search(block)
     return (d.group(1).strip() if d else "")
+
+
+def _skill_disables_model_invocation(path: str) -> bool:
+    return bool(_DISABLE_MODEL_RE.search(_read_skill_frontmatter(path)))
+
+
+def _read_skill_overrides(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    overrides = data.get("skillOverrides")
+    if not isinstance(overrides, dict):
+        return {}
+    return {str(k): str(v) for k, v in overrides.items()}
+
+
+def _settings_paths_from_db(db_path) -> list:
+    """Find project settings.local.json files from cwds recorded in the DB."""
+    paths: set = set()
+    with connect(db_path) as c:
+        cwds = [r[0] for r in c.execute(
+            "SELECT DISTINCT cwd FROM messages WHERE cwd IS NOT NULL"
+        )]
+    for cwd in cwds:
+        if not cwd:
+            continue
+        p = Path(cwd)
+        for ancestor in (p, *p.parents):
+            settings = ancestor / ".claude" / "settings.local.json"
+            if settings.is_file():
+                paths.add(settings)
+                break
+    return sorted(paths)
+
+
+def _skill_overrides(db_path) -> dict:
+    """Return merged global + project skillOverrides. Project settings win."""
+    merged = _read_skill_overrides(_USER_SETTINGS_PATH)
+    for path in _settings_paths_from_db(db_path):
+        merged.update(_read_skill_overrides(path))
+    return merged
+
+
+def _description_visible(slugs: set, overrides: dict) -> bool:
+    for slug in slugs:
+        if overrides.get(slug) in _DESCRIPTION_HIDDEN_OVERRIDES:
+            return False
+    return True
 
 
 # Default context-window-1%-equivalent in characters.
@@ -349,6 +409,7 @@ def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
         return []
 
     top_cwd = _most_active_cwd(db_path, since)
+    overrides = _skill_overrides(db_path)
 
     # Group slugs by the SKILL.md they resolve to: a single file commonly
     # registers two slugs (bare + "<plugin>:<bare>"). Each path is one skill
@@ -362,7 +423,12 @@ def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
         })
         entry["slugs"].append(slug)
     for p, entry in per_path.items():
-        entry["desc_chars"] = len(_read_skill_description(p))
+        if _skill_disables_model_invocation(p) or not _description_visible(
+            set(entry["slugs"]), overrides
+        ):
+            entry["desc_chars"] = 0
+        else:
+            entry["desc_chars"] = len(_read_skill_description(p))
         entry["active_here"] = is_active_in_cwd(
             entry["scope"], entry["project_path"], top_cwd,
         )
@@ -397,7 +463,7 @@ def skill_listing_budget_tips(db_path, today_iso: Optional[str] = None,
     # skills active in the current context — uninstalling a skill that isn't
     # even loaded here wouldn't help this session's budget.
     ranked_paths = sorted(
-        active_paths.items(),
+        [(p, e) for p, e in active_paths.items() if e["desc_chars"] > 0],
         key=lambda kv: (kv[1]["usage"], -kv[1]["desc_chars"]),
     )
     worst = [_display_slug(entry["slugs"]) for _, entry in ranked_paths[:5]]

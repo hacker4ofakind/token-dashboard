@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -357,6 +358,62 @@ class SkillListingBudgetTests(unittest.TestCase):
             candidates_section.count("shopware-app-system"), 1,
             "Plugin skill must appear exactly once in candidates list",
         )
+
+    def test_disable_model_invocation_skill_does_not_count_toward_budget(self):
+        long_desc = "x" * 300
+        _make_skill(self.skills_root, "visible", long_desc)
+        d = self.skills_root / "skills" / "hidden"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: hidden\ndescription: {long_desc}\n"
+            "disable-model-invocation: true\n---\n\nBody.\n",
+            encoding="utf-8",
+        )
+        patch_ctx, s = self._patch_roots()
+        with patch_ctx:
+            s._cache = {"at": 0.0, "data": {}, "key": None}
+            tips = skill_listing_budget_tips(
+                self.db, today_iso="2026-04-19T00:00:00", budget_chars=500,
+            )
+        # Only `visible` counts (~300 chars) which is under the 500-char budget.
+        self.assertEqual(tips, [])
+
+    def test_skill_override_user_invocable_only_does_not_count(self):
+        long_desc = "x" * 300
+        _make_skill(self.skills_root, "visible", long_desc)
+        _make_skill(self.skills_root, "quiet", long_desc)
+        settings = self.tmp / "settings.json"
+        settings.write_text(
+            json.dumps({"skillOverrides": {"quiet": "user-invocable-only"}}),
+            encoding="utf-8",
+        )
+        patch_ctx, s = self._patch_roots()
+        from token_dashboard import tips as tips_mod
+        with patch_ctx, mock.patch.object(tips_mod, "_USER_SETTINGS_PATH", settings):
+            s._cache = {"at": 0.0, "data": {}, "key": None}
+            tips = skill_listing_budget_tips(
+                self.db, today_iso="2026-04-19T00:00:00", budget_chars=500,
+            )
+        # Only `visible` counts — `quiet` is user-invocable-only.
+        self.assertEqual(tips, [])
+
+    def test_skill_override_off_does_not_count(self):
+        long_desc = "x" * 300
+        _make_skill(self.skills_root, "visible", long_desc)
+        _make_skill(self.skills_root, "disabled", long_desc)
+        settings = self.tmp / "settings.json"
+        settings.write_text(
+            json.dumps({"skillOverrides": {"disabled": "off"}}),
+            encoding="utf-8",
+        )
+        patch_ctx, s = self._patch_roots()
+        from token_dashboard import tips as tips_mod
+        with patch_ctx, mock.patch.object(tips_mod, "_USER_SETTINGS_PATH", settings):
+            s._cache = {"at": 0.0, "data": {}, "key": None}
+            tips = skill_listing_budget_tips(
+                self.db, today_iso="2026-04-19T00:00:00", budget_chars=500,
+            )
+        self.assertEqual(tips, [])
 
 
 class DeadSkillsTests(unittest.TestCase):
