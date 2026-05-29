@@ -9,7 +9,8 @@ function toUsd(tokens) {
 }
 
 function today() {
-  return new Date().toLocaleDateString('sv', { timeZone: 'America/New_York' });
+  // Browser-local day, to match the rtk CLI's local-time daily buckets.
+  return new Date().toLocaleDateString('sv');
 }
 
 export default async function (root) {

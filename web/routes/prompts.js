@@ -105,7 +105,7 @@ function renderPrompts(root, rows, sort) {
 
   root.querySelector('#export-csv').addEventListener('click', () => {
     const csv = toCSV(sections);
-    const stamp = new Date().toISOString().slice(0, 10);
+    const stamp = new Date().toLocaleDateString('sv'); // browser-local YYYY-MM-DD
     downloadBlob(`prompts-${sort.key}-${stamp}.csv`, 'text/csv', csv);
   });
 

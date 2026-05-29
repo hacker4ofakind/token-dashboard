@@ -21,7 +21,9 @@ export const fmt = {
     return '';
   },
   modelShort: m => (m || '').replace('claude-', ''),
-  ts: t => t ? new Date(t).toLocaleString('sv', { timeZone: 'America/New_York' }).slice(0, 16) : '',
+  // Browser-local zone: 'sv' locale renders ISO-like "YYYY-MM-DD HH:MM:SS"; slice keeps date + minutes.
+  ts:   t => t ? new Date(t).toLocaleString('sv').slice(0, 16) : '',
+  time: t => t ? new Date(t).toLocaleTimeString('sv') : '',
 };
 
 /**

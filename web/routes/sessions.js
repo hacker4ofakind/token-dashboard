@@ -141,7 +141,7 @@ function buildSession(root, id, turns, initFilter, initCol, initDir) {
             const tout = t.output_tokens      || 0;
             const trd  = t.cache_read_tokens  || 0;
             return `<tr data-tin="${tin}" data-tout="${tout}" data-trd="${trd}">
-              <td class="mono" data-val="${t.timestamp || ''}">${(t.timestamp || '').slice(11,19)}</td>
+              <td class="mono" data-val="${t.timestamp || ''}">${fmt.time(t.timestamp)}</td>
               <td data-val="${t.type || ''}">${t.type}${t.is_sidechain ? ' <span class="badge">side</span>' : ''}</td>
               <td data-val="${t.model || ''}">${t.model ? `<span class="badge ${fmt.modelClass(t.model)}">${fmt.htmlSafe(fmt.modelShort(t.model))}</span>` : ''}</td>
               <td class="blur-sensitive" data-val="">${fmt.htmlSafe(summary)}</td>
