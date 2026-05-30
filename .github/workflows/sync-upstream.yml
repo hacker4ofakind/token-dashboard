@@ -21,6 +21,4 @@ jobs:
         run: |
           git remote add upstream https://github.com/muckybuzzwoo/token-dashboard.git
           git fetch upstream main
-          git checkout main
-          git reset --hard upstream/main
-          git push origin main --force
+          git push origin upstream/main:main --force
