@@ -36,6 +36,59 @@ function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
+// Lightweight type-ahead for an <input>. The native <datalist> popup can't be
+// styled or bounded — with long values it renders very wide and unbounded — so
+// we own the menu: it opens downward, matches the input width (long values
+// ellipsize instead of widening the page), and caps the result count.
+function attachAutocomplete(input, items, limit = 8) {
+  const wrap = input.parentElement;            // the position:relative .ac span
+  const menu = document.createElement('div');
+  menu.className = 'ac-menu';
+  menu.hidden = true;
+  wrap.appendChild(menu);
+  let current = [], active = -1, suppress = false;
+
+  function build() {
+    if (suppress) { suppress = false; return; }
+    const q = input.value.trim().toLowerCase();
+    const all = q ? items.filter(s => s.toLowerCase().includes(q)) : items;
+    current = all.slice(0, limit);
+    active = -1;
+    if (!current.length) { menu.hidden = true; return; }
+    menu.innerHTML = current.map((s, i) =>
+      `<div class="ac-item" data-i="${i}" title="${fmt.htmlSafe(s)}">${fmt.htmlSafe(s)}</div>`).join('')
+      + (all.length > current.length
+          ? `<div class="ac-more">+${all.length - current.length} more — keep typing…</div>` : '');
+    menu.hidden = false;
+  }
+  function highlight() {
+    menu.querySelectorAll('.ac-item').forEach((el, i) => el.classList.toggle('active', i === active));
+  }
+  function pick(i) {
+    if (i < 0 || i >= current.length) return;
+    suppress = true;                            // don't re-open the menu for the synthetic input
+    input.value = current[i];
+    menu.hidden = true;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  input.addEventListener('input', build);
+  input.addEventListener('focus', build);
+  input.addEventListener('keydown', e => {
+    if (menu.hidden) return;
+    if (e.key === 'ArrowDown')      { e.preventDefault(); active = Math.min(active + 1, current.length - 1); highlight(); }
+    else if (e.key === 'ArrowUp')   { e.preventDefault(); active = Math.max(active - 1, 0); highlight(); }
+    else if (e.key === 'Enter' && active >= 0) { e.preventDefault(); pick(active); }
+    else if (e.key === 'Escape')    { menu.hidden = true; }
+  });
+  // mousedown (not click) fires before the input's blur, so the pick registers.
+  menu.addEventListener('mousedown', e => {
+    const item = e.target.closest('.ac-item');
+    if (item) { e.preventDefault(); pick(Number(item.dataset.i)); }
+  });
+  input.addEventListener('blur', () => { setTimeout(() => { menu.hidden = true; }, 120); });
+}
+
 function buildList(root, list, qs) {
   const initCol = parseInt(qs.get('sort') ?? '0', 10);
   const initDir = qs.get('dir') || 'desc';
@@ -68,9 +121,8 @@ function buildList(root, list, qs) {
         </div>
       </div>
       <div class="flex" style="margin-bottom:10px;flex-wrap:wrap;gap:10px;align-items:center">
-        <input id="f-project" list="dl-projects" placeholder="all projects…" value="${fmt.htmlSafe(state.project)}" style="min-width:170px" title="Filter by project — type to autocomplete, or pick from the list">
-        <input id="f-search" type="search" list="dl-projects" placeholder="search project or session…" value="${fmt.htmlSafe(state.q)}" style="flex:1;min-width:180px" title="Substring match on project name or session id">
-        <datalist id="dl-projects">${projects.map(p => `<option value="${fmt.htmlSafe(p)}"></option>`).join('')}</datalist>
+        <span class="ac" style="min-width:170px"><input id="f-project" autocomplete="off" placeholder="all projects…" value="${fmt.htmlSafe(state.project)}" style="width:100%" title="Filter by project — type to autocomplete, or pick from the list"></span>
+        <span class="ac" style="flex:1;min-width:180px"><input id="f-search" type="search" autocomplete="off" placeholder="search project or session…" value="${fmt.htmlSafe(state.q)}" style="width:100%" title="Substring match on project name or session id"></span>
         <input id="f-mincost" type="number" min="0" step="0.5" placeholder="min $" value="${fmt.htmlSafe(state.minCost)}" style="width:90px" title="Minimum cost (USD)">
         <input id="f-mintokens" type="number" min="0" step="1000" placeholder="min tokens" value="${fmt.htmlSafe(state.minTokens)}" style="width:110px" title="Minimum tokens">
         <button id="f-clear" type="button" title="Clear all filters">Clear</button>
@@ -200,6 +252,8 @@ function buildList(root, list, qs) {
   el('#f-search').addEventListener('input', e => { state.q = e.target.value; refresh(); });
   el('#f-mincost').addEventListener('input', e => { state.minCost = e.target.value; refresh(); });
   el('#f-mintokens').addEventListener('input', e => { state.minTokens = e.target.value; refresh(); });
+  attachAutocomplete(el('#f-project'), projects);
+  attachAutocomplete(el('#f-search'), projects);
 
   // Quick-period tabs clear any custom range.
   root.querySelectorAll('#period-tabs button').forEach(btn => {
