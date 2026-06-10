@@ -8,6 +8,13 @@ The Skills route shows every skill Claude Code invoked, how many times, across h
 
 Cost attribution for orchestrator skills — any skill that dispatches subagents via `Task`/`Agent` — follows the `parent_uuid` chain from every dispatch back to the skill call that emitted it. The `total inc. subagents` column on the Skills tab reflects that. If you upgraded from an older build and the column looks low, run `python3 cli.py rescan-agent-targets` once to re-parse main-session JSONLs whose Agent rows lost their `subagent_type` target.
 
+## The Prompts tab shows your main-thread prompts only
+
+The Prompts route lists each typed prompt and the assistant work it triggered, linked by **session + timestamp window**. Newer Claude Code versions interpose `attachment` records between a prompt and its assistant turn (and put no `promptId` on assistant rows), so the original `parent_uuid` link became unreliable and the tab appeared frozen — see `FORK_NOTES.md`. Two consequences of the window-based linkage:
+
+- **Subagent / `Task` prompts don't appear here.** Only main-thread prompts (`is_sidechain = 0`) are listed; subagent dispatch prompts and their token spend live on the **Subagents** tab instead.
+- **`tokens` is the whole turn, and programmatic prompts show up too.** The token figure aggregates every main-thread assistant message from a prompt up to the next one — the full turn including its tool loop, not just the first reply. A transcript can't tell a hand-typed prompt from a programmatic one, so an SDK/agent harness that re-feeds a large instruction block each turn appears as a prompt too, usually with large token counts.
+
 ## Cost for Pro / Max / Max-20x users is shown as API-equivalent, not subscription value
 
 The Settings route lets you select your pricing plan, but the Overview cost number is always the API-equivalent (what the same usage would have cost on pay-per-token rates). If you're on Pro you pay a flat $20/month regardless of how much of that API-equivalent number you rack up. We don't do "subscription ROI" math yet — Anthropic doesn't publish per-plan rate limits as public JSON, and faking it would be worse than not doing it.
@@ -18,7 +25,7 @@ If you use Claude's Cowork mode (server-side sessions, not local `claude` CLI), 
 
 ## Non-standard model names get tier-fallback pricing
 
-If a transcript references a model ID not in `pricing.json` (e.g. a future snapshot that isn't in our table yet), cost is estimated from the tier substring (`opus` / `sonnet` / `haiku`) in the name. The UI marks these as `estimated: true`. If the model name contains none of those substrings, cost is reported as null.
+If a transcript references a model ID not in `pricing.json` (e.g. a future snapshot that isn't in our table yet), cost is estimated from the tier substring (`fable` / `opus` / `sonnet` / `haiku`) in the name. The UI marks these as `estimated: true`. If the model name contains none of those substrings, cost is reported as null.
 
 ## First scan can be slow
 
