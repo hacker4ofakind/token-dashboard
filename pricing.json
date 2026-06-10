@@ -1,5 +1,13 @@
 {
   "models": {
+    "claude-fable-5": {
+      "tier": "fable",
+      "input": 10.00,
+      "output": 50.00,
+      "cache_read": 1.00,
+      "cache_create_5m": 12.50,
+      "cache_create_1h": 20.00
+    },
     "claude-opus-4-8": {
       "tier": "opus",
       "input": 5.00,
@@ -42,6 +50,13 @@
     }
   },
   "tier_fallback": {
+    "fable": {
+      "input": 10.00,
+      "output": 50.00,
+      "cache_read": 1.00,
+      "cache_create_5m": 12.50,
+      "cache_create_1h": 20.00
+    },
     "opus": {
       "input": 15.00,
       "output": 75.00,
