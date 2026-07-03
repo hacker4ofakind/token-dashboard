@@ -27,6 +27,16 @@ class CostTests(unittest.TestCase):
         c = cost_for("claude-sonnet-4-6", self._u(output_tokens=1_000_000), self.p)
         self.assertAlmostEqual(c["usd"], 15.00, places=4)
 
+    def test_known_sonnet_5_input_cost(self):
+        c = cost_for("claude-sonnet-5", self._u(input_tokens=1_000_000), self.p)
+        self.assertAlmostEqual(c["usd"], 3.00, places=4)
+        self.assertFalse(c["estimated"])
+
+    def test_known_sonnet_5_output_cost(self):
+        c = cost_for("claude-sonnet-5", self._u(output_tokens=1_000_000), self.p)
+        self.assertAlmostEqual(c["usd"], 15.00, places=4)
+        self.assertFalse(c["estimated"])
+
     def test_known_fable_input_cost(self):
         c = cost_for("claude-fable-5", self._u(input_tokens=1_000_000), self.p)
         self.assertAlmostEqual(c["usd"], 10.00, places=4)
