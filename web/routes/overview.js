@@ -83,7 +83,7 @@ function renderBundle(root, { totals, projects, sessions, tools, daily, byModel 
       ${kpi('Cache create', fmt.compact(cacheCreate),               fmt.int(cacheCreate) + ' tokens')}
       <div class="card kpi cost">
         <div class="label">Est. cost</div>
-        <div class="value blur-sensitive" title="${fmt.usd(totals.cost_usd)}">${fmt.usd(totals.cost_usd)}</div>
+        <div class="value blur-sensitive" title="API pay-per-token value of your usage — not your actual subscription bill">${fmt.usd(totals.cost_usd)}</div>
         ${planSubtitle()}
       </div>
     </div>
