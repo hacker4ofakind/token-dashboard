@@ -211,6 +211,23 @@ def _serve_static(handler, rel: str) -> None:
     handler.wfile.write(body)
 
 
+def _mcp_usage_calls(server_name: str, tools) -> Optional[int]:
+    """Total tool-call count for one MCP server.
+
+    MCP tool names are ``mcp__<server>__<tool>``; match the server segment
+    exactly so a short name ("git") does not absorb another server's calls
+    ("github"). ``tools`` is a tool_token_breakdown list. Returns None when the
+    server has no recorded calls.
+    """
+    norm = server_name.lower().replace(" ", "_")
+    total = 0
+    for t in tools:
+        parts = t["tool_name"].lower().split("__")
+        if len(parts) >= 3 and parts[0] == "mcp" and parts[1] == norm:
+            total += t["calls"]
+    return total or None
+
+
 def _claude_dir(db_path: str) -> Path:
     saved = get_setting(db_path, "claude_dir")
     return Path(saved).expanduser() if saved else default_claude_dir()
@@ -515,11 +532,7 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 rows = scan_mcp()
                 tools = tool_token_breakdown(db_path, since, until)
                 for r in rows:
-                    norm = r["name"].lower().replace(" ", "_")
-                    r["usage_calls"] = sum(
-                        t["calls"] for t in tools
-                        if t["tool_name"].startswith("mcp__") and norm in t["tool_name"].lower()
-                    ) or None
+                    r["usage_calls"] = _mcp_usage_calls(r["name"], tools)
                 _cache_set(cache_key, rows)
                 return _send_json(self, rows)
             if path == "/api/hooks":

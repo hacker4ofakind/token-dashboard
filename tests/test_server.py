@@ -213,6 +213,24 @@ class ServerTests(unittest.TestCase):
         self.assertIsNone(body["summary"])
 
 
+class McpUsageMatchTests(unittest.TestCase):
+    def test_matches_server_segment_exactly_not_as_substring(self):
+        # MCP tool names are mcp__<server>__<tool>. A "git" server must not
+        # absorb calls belonging to "github" (a substring match would).
+        tools = [
+            {"tool_name": "mcp__github__create_issue", "calls": 5},
+            {"tool_name": "mcp__git__commit", "calls": 3},
+            {"tool_name": "Read", "calls": 99},
+        ]
+        self.assertEqual(server._mcp_usage_calls("git", tools), 3)
+        self.assertEqual(server._mcp_usage_calls("github", tools), 5)
+
+    def test_normalises_spaces_and_returns_none_when_unused(self):
+        tools = [{"tool_name": "mcp__my_server__do", "calls": 4}]
+        self.assertEqual(server._mcp_usage_calls("My Server", tools), 4)
+        self.assertIsNone(server._mcp_usage_calls("absent", tools))
+
+
 class RefreshTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
