@@ -236,6 +236,27 @@ class ResolveStaticTests(unittest.TestCase):
         self.assertIsNone(server._resolve_static(root, "../../etc/passwd"))
 
 
+class EventStreamBrokerTests(unittest.TestCase):
+    def test_publish_fans_out_to_every_subscriber(self):
+        # Two open /api/stream tabs must BOTH receive each event. A single
+        # shared queue would hand it to only one of them.
+        q1 = server._subscribe()
+        q2 = server._subscribe()
+        try:
+            server._publish_event({"type": "scan", "n": 7})
+            self.assertEqual(q1.get_nowait()["n"], 7)
+            self.assertEqual(q2.get_nowait()["n"], 7)
+        finally:
+            server._unsubscribe(q1)
+            server._unsubscribe(q2)
+
+    def test_unsubscribe_stops_delivery(self):
+        q = server._subscribe()
+        server._unsubscribe(q)
+        server._publish_event({"type": "scan", "n": 1})
+        self.assertTrue(q.empty())
+
+
 class McpUsageMatchTests(unittest.TestCase):
     def test_matches_server_segment_exactly_not_as_substring(self):
         # MCP tool names are mcp__<server>__<tool>. A "git" server must not

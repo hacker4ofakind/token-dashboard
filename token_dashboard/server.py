@@ -36,7 +36,33 @@ from .hooks_catalog import scan_hooks, scan_commands, scan_agents
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 PRICING_JSON = Path(__file__).resolve().parent.parent / "pricing.json"
 
-EVENTS: "queue.Queue[dict]" = queue.Queue()
+# Server-sent events fan out to every open /api/stream connection. A single
+# shared queue.Queue would hand each event to just one connection (whichever
+# get() wins), so with two browser tabs open only one would see a scan/error
+# event. Each connection subscribes its own queue; producers broadcast to all.
+_EVENT_SUBS: "set[queue.Queue[dict]]" = set()
+_EVENT_SUBS_LOCK = threading.Lock()
+
+
+def _subscribe() -> "queue.Queue[dict]":
+    q: "queue.Queue[dict]" = queue.Queue()
+    with _EVENT_SUBS_LOCK:
+        _EVENT_SUBS.add(q)
+    return q
+
+
+def _unsubscribe(q) -> None:
+    with _EVENT_SUBS_LOCK:
+        _EVENT_SUBS.discard(q)
+
+
+def _publish_event(evt: dict) -> None:
+    with _EVENT_SUBS_LOCK:
+        subs = list(_EVENT_SUBS)
+    for q in subs:
+        q.put(evt)
+
+
 # Keep cache resets and concurrent scans from interleaving with background scans.
 SCAN_LOCK = threading.Lock()
 
@@ -104,14 +130,14 @@ _WARM_DEFAULT_DAYS = 30          # the range the UI lands on first
 def _do_refresh(db_path: str, projects_dir: str, pricing: dict) -> None:
     """One-shot scan + cache-clear + warm, used by the manual /api/refresh endpoint."""
     if not SCAN_LOCK.acquire(blocking=False):
-        EVENTS.put({"type": "scan-skip", "reason": "already-running", "ts": time.time()})
+        _publish_event({"type": "scan-skip", "reason": "already-running", "ts": time.time()})
         return
     try:
         n = scan_dir(_projects_dir(db_path, projects_dir), db_path)
         _cache_clear()
-        EVENTS.put({"type": "scan", "n": n, "ts": time.time()})
+        _publish_event({"type": "scan", "n": n, "ts": time.time()})
     except Exception as e:
-        EVENTS.put({"type": "error", "message": str(e)})
+        _publish_event({"type": "error", "message": str(e)})
     finally:
         SCAN_LOCK.release()
 
@@ -569,17 +595,21 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
-                while True:
-                    try:
-                        evt = EVENTS.get(timeout=15)
-                        chunk = f"data: {json.dumps(evt, default=str)}\n\n".encode()
-                    except queue.Empty:
-                        chunk = b": ping\n\n"
-                    try:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
-                        return
+                q = _subscribe()
+                try:
+                    while True:
+                        try:
+                            evt = q.get(timeout=15)
+                            chunk = f"data: {json.dumps(evt, default=str)}\n\n".encode()
+                        except queue.Empty:
+                            chunk = b": ping\n\n"
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+                finally:
+                    _unsubscribe(q)
             self.send_response(404)
             self.end_headers()
 
@@ -647,11 +677,11 @@ def _scan_loop(db_path: str, projects_dir: Optional[str] = None, interval: float
                     # Emit the event even when messages == 0 so the frontend's
                     # "Getting latest data…" banner clears once the scan finishes.
                     # The frontend uses n.messages to decide whether to flag new data.
-                    EVENTS.put({"type": "scan", "n": n, "ts": time.time()})
+                    _publish_event({"type": "scan", "n": n, "ts": time.time()})
                 finally:
                     SCAN_LOCK.release()
         except Exception as e:
-            EVENTS.put({"type": "error", "message": str(e)})
+            _publish_event({"type": "error", "message": str(e)})
         time.sleep(interval)
 
 
