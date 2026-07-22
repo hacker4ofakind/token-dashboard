@@ -139,6 +139,7 @@ def repeated_target_tips(db_path, today_iso: Optional[str] = None) -> List[dict]
     since = _iso_days_ago(today_iso, 7)
     out = []
     with connect(db_path) as c:
+        file_insts = []
         for row in c.execute("""
           SELECT target, COUNT(*) AS n, COUNT(DISTINCT session_id) AS sessions
             FROM tool_calls
@@ -156,15 +157,21 @@ def repeated_target_tips(db_path, today_iso: Optional[str] = None) -> List[dict]
                     GROUP BY session_id ORDER BY COUNT(*) DESC LIMIT 1""",
                 (row["target"], since),
             ).fetchone()
-            out.append(_make_tip(
-                key=key, category="repeat-file", severity="info",
-                title=f"{row['target']} read {row['n']} times",
-                body=(f"This file was opened {row['n']} times across {row['sessions']} sessions "
-                      "in the past 7 days. A summary in CLAUDE.md or one read per session would "
-                      "avoid repeats."),
-                scope=row["target"],
+            file_insts.append(_instance(
+                title=f"{row['target']} — {row['n']}× across {row['sessions']} sessions",
+                key=key,
                 links=[_session_link(worst["session_id"] if worst else None, "Heaviest session")],
             ))
+        if file_insts:
+            out.append(_make_tip(
+                key=_key("repeat-file", "overall"), category="repeat-file", severity="info",
+                title="Files read repeatedly",
+                body=("Opening the same file many times across sessions wastes tokens. "
+                      "A summary in CLAUDE.md, or one read per session, avoids the repeats."),
+                scope="overall", instances=file_insts,
+            ))
+
+        bash_insts = []
         for row in c.execute("""
           SELECT target, COUNT(*) AS n
             FROM tool_calls
@@ -181,12 +188,18 @@ def repeated_target_tips(db_path, today_iso: Optional[str] = None) -> List[dict]
                     GROUP BY session_id ORDER BY COUNT(*) DESC LIMIT 1""",
                 (row["target"], since),
             ).fetchone()
-            out.append(_make_tip(
-                key=key, category="repeat-bash", severity="info",
-                title=f"`{row['target']}` ran {row['n']} times",
-                body=f"This bash command ran {row['n']} times in the past 7 days. Consider a watch flag or shell alias.",
-                scope=row["target"],
+            bash_insts.append(_instance(
+                title=f"`{row['target']}` — ran {row['n']}×",
+                key=key,
                 links=[_session_link(worst["session_id"] if worst else None, "Heaviest session")],
+            ))
+        if bash_insts:
+            out.append(_make_tip(
+                key=_key("repeat-bash", "overall"), category="repeat-bash", severity="info",
+                title="Commands run repeatedly",
+                body=("Re-running the same command many times suggests a watch flag "
+                      "or shell alias would save the round-trips."),
+                scope="overall", instances=bash_insts,
             ))
     return out
 

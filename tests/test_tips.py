@@ -74,15 +74,47 @@ class RepeatTipTests(unittest.TestCase):
                 c.execute("INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, timestamp, is_error) VALUES ('m1','s1','p','Bash','npm run lint','2026-04-15T00:00:00Z',0)")
             c.commit()
 
-    def test_repeated_tips_carry_session_link(self):
+    def test_repeat_file_and_bash_grouped(self):
         tips = repeated_target_tips(self.db, today_iso="2026-04-19T00:00:00")
         by_cat = {t["category"]: t for t in tips}
         self.assertIn("repeat-file", by_cat)
         self.assertIn("repeat-bash", by_cat)
-        for t in (by_cat["repeat-file"], by_cat["repeat-bash"]):
-            _assert_tip_shape(self, t)
-            hrefs = [l["href"] for l in t["links"]]
-            self.assertIn("#/sessions/s1", hrefs)
+
+        rf = by_cat["repeat-file"]
+        _assert_tip_shape(self, rf)
+        self.assertEqual(rf["title"], "Files read repeatedly")
+        self.assertIn("CLAUDE.md", rf["body"])          # shared explanation present once
+        self.assertEqual(len(rf["instances"]), 1)
+        inst = rf["instances"][0]
+        self.assertEqual(inst["key"], "repeat-file:src/Root.tsx")
+        self.assertIn("#/sessions/s1", [l["href"] for l in inst["links"]])
+
+        rb = by_cat["repeat-bash"]
+        self.assertEqual(rb["title"], "Commands run repeatedly")
+        self.assertEqual(len(rb["instances"]), 1)
+        self.assertEqual(rb["instances"][0]["key"], "repeat-bash:npm run lint")
+
+    def test_repeat_file_dismiss_removes_one_instance(self):
+        with connect(self.db) as c:
+            c.execute("INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, model) VALUES ('m2','s2','p','assistant','2026-04-15T00:00:00Z','claude-opus-4-7')")
+            for _ in range(12):
+                c.execute("INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, timestamp, is_error) VALUES ('m2','s2','p','Read','a.py','2026-04-15T00:00:00Z',0)")
+            for _ in range(12):
+                c.execute("INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, timestamp, is_error) VALUES ('m2','s2','p','Read','b.py','2026-04-15T00:00:00Z',0)")
+            c.commit()
+        dismiss_tip(self.db, "repeat-file:a.py")
+        tips = repeated_target_tips(self.db, today_iso="2026-04-19T00:00:00")
+        rf = [t for t in tips if t["category"] == "repeat-file"][0]
+        keys = {i["key"] for i in rf["instances"]}
+        self.assertNotIn("repeat-file:a.py", keys)
+        self.assertIn("repeat-file:b.py", keys)
+        self.assertIn("repeat-file:src/Root.tsx", keys)  # from class setUp, still present
+
+    def test_repeat_file_group_gone_when_all_dismissed(self):
+        # class setUp only seeds src/Root.tsx as a repeat-file; dismiss it -> whole group gone
+        dismiss_tip(self.db, "repeat-file:src/Root.tsx")
+        tips = repeated_target_tips(self.db, today_iso="2026-04-19T00:00:00")
+        self.assertEqual([t for t in tips if t["category"] == "repeat-file"], [])
 
 
 class RightSizeTests(unittest.TestCase):
