@@ -28,6 +28,9 @@ from .pricing import load_pricing, cost_for, get_plan, set_plan
 from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
 from .skills import cached_catalog
+from .plugins import cached_plugins
+from .mcp_catalog import scan_mcp
+from .hooks_catalog import scan_hooks, scan_commands, scan_agents
 
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -391,6 +394,7 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 for r in rows:
                     info = catalog.get(r["skill"])
                     r["tokens_per_call"] = info["tokens"] if info else None
+                    r["description"] = info["description"] if info else ""
                     r["budget_output_tokens"] = budget_for(r["skill"], catalog)
                     a = actuals.get(r["skill"])
                     r["p50_output_tokens"] = a["p50"] if a else None
@@ -502,6 +506,28 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 return _send_json(self, data)
             if path == "/api/plan":
                 return _send_json(self, {"plan": get_plan(db_path), "pricing": pricing})
+            if path == "/api/plugins":
+                return _send_json(self, cached_plugins())
+            if path == "/api/mcp":
+                cached = _cache_get(cache_key)
+                if cached is not None:
+                    return _send_json(self, cached)
+                rows = scan_mcp()
+                tools = tool_token_breakdown(db_path, since, until)
+                for r in rows:
+                    norm = r["name"].lower().replace(" ", "_")
+                    r["usage_calls"] = sum(
+                        t["calls"] for t in tools
+                        if t["tool_name"].startswith("mcp__") and norm in t["tool_name"].lower()
+                    ) or None
+                _cache_set(cache_key, rows)
+                return _send_json(self, rows)
+            if path == "/api/hooks":
+                return _send_json(self, scan_hooks())
+            if path == "/api/commands":
+                return _send_json(self, scan_commands())
+            if path == "/api/agents":
+                return _send_json(self, scan_agents())
             if path == "/api/settings":
                 return _send_json(self, _settings_payload(db_path, projects_dir))
             if path == "/api/scan":

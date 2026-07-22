@@ -108,7 +108,10 @@ function renderSkills(root, skills, range) {
         <tbody>
           ${[...skills].sort((a, b) => ((b.total_with_subagents_usd ?? b.total_cost_usd) || 0) - ((a.total_with_subagents_usd ?? a.total_cost_usd) || 0)).map(s => `
             <tr>
-              <td data-val="${fmt.htmlSafe(s.skill)}"><span class="badge">${fmt.htmlSafe(s.skill)}</span></td>
+              <td data-val="${fmt.htmlSafe(s.skill)}">
+                <span class="badge">${fmt.htmlSafe(s.skill)}</span>
+                ${s.description ? `<div class="muted" style="font-size:11px;margin-top:2px">${fmt.htmlSafe(s.description)}</div>` : ''}
+              </td>
               <td class="num" data-val="${s.manual_sessions  || 0}">${s.manual_sessions  ? fmt.int(s.manual_sessions)  : '<span class="muted">—</span>'}</td>
               <td class="num" data-val="${s.tool_invocations || 0}">${s.tool_invocations ? fmt.int(s.tool_invocations) : '<span class="muted">—</span>'}</td>
               <td class="num" data-val="${s.tokens_per_call ?? ''}">${s.tokens_per_call == null ? '<span class="muted">—</span>' : fmt.int(s.tokens_per_call)}</td>

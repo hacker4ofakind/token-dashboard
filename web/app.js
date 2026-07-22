@@ -25,6 +25,7 @@ export const fmt = {
   // Browser-local zone: 'sv' locale renders ISO-like "YYYY-MM-DD HH:MM:SS"; slice keeps date + minutes.
   ts:   t => t ? new Date(t).toLocaleString('sv').slice(0, 16) : '',
   time: t => t ? new Date(t).toLocaleTimeString('sv') : '',
+  editorLink: p => p ? 'vscode://file/' + p.split('/').map(encodeURIComponent).join('/') : null,
 };
 
 const PRIVACY_KEY = 'td.privacy-on';
@@ -136,25 +137,66 @@ const ROUTES = {
   '/workspaces': () => import('/web/routes/workspaces.js'),
   '/subagents':  () => import('/web/routes/subagents.js'),
   '/skills':     () => import('/web/routes/skills.js'),
+  '/plugins':    () => import('/web/routes/plugins.js'),
+  '/mcp':        () => import('/web/routes/mcp.js'),
+  '/hooks':      () => import('/web/routes/hooks.js'),
   '/tips':       () => import('/web/routes/tips.js'),
   '/rtk':        () => import('/web/routes/rtk.js'),
   '/settings':   () => import('/web/routes/settings.js'),
 };
 
+const NAV_GROUPS = [
+  { key: 'register', label: 'Register', routes: ['/skills', '/plugins', '/mcp', '/hooks'] },
+];
+
+// Flattens ROUTES into an ordered render list: standalone links stay as-is;
+// the first route that belongs to a group is replaced by the group's
+// dropdown trigger (so the trigger renders in that route's original
+// position), later members of the same group are skipped.
+function navItems() {
+  const groupByRoute = new Map();
+  NAV_GROUPS.forEach(g => g.routes.forEach(r => groupByRoute.set(r, g)));
+  const seenGroups = new Set();
+  const items = [];
+  Object.keys(ROUTES).forEach(path => {
+    const group = groupByRoute.get(path);
+    if (group) {
+      if (seenGroups.has(group.key)) return;
+      seenGroups.add(group.key);
+      items.push({ type: 'group', group });
+    } else {
+      items.push({ type: 'link', path });
+    }
+  });
+  return items;
+}
+
 function buildTopbar() {
   const wrap = document.createElement('header');
   wrap.className = 'topbar';
+  const navHtml = navItems().map(item => {
+    if (item.type === 'link') {
+      return `<a href="#${item.path}" data-route="${item.path}">${item.path.slice(1)}</a>`;
+    }
+    const g = item.group;
+    return `
+      <div class="nav-group" data-group="${g.key}">
+        <button type="button" class="nav-group-trigger" data-group-trigger="${g.key}" aria-expanded="false">${g.label} <span class="caret">▾</span></button>
+        <div class="nav-group-menu" data-group-menu="${g.key}" hidden>
+          ${g.routes.map(p => `<a href="#${p}" data-route="${p}">${p.slice(1)}</a>`).join('')}
+        </div>
+      </div>`;
+  }).join('');
   wrap.innerHTML = `
     <div class="brand">Token Dashboard</div>
-    <nav>
-      ${Object.keys(ROUTES).map(p => `<a href="#${p}" data-route="${p}">${p.slice(1)}</a>`).join('')}
-    </nav>
+    <nav>${navHtml}</nav>
     <div class="spacer"></div>
     <span class="pill blur-sensitive" id="plan-pill">api</span>
     <button id="privacy-toggle" class="pill privacy-toggle" type="button" title="Ctrl/Cmd/Alt+B blurs sensitive text" aria-pressed="false">blur off</button>
     <button id="refresh-btn" class="refresh-btn" title="Manually refresh data">↻ 60s</button>
   `;
   document.body.prepend(wrap);
+  wireNavGroups(wrap);
 
   // Refresh banner — inserted between topbar and #app
   const banner = document.createElement('div');
@@ -162,6 +204,29 @@ function buildTopbar() {
   banner.className = 'refresh-banner hidden';
   banner.innerHTML = '<span class="spin">↻</span><span>Getting latest data…</span>';
   document.body.insertBefore(banner, document.getElementById('app'));
+}
+
+function wireNavGroups(topbar) {
+  function closeAll() {
+    $$('.nav-group-menu', topbar).forEach(m => { m.hidden = true; });
+    $$('.nav-group-trigger', topbar).forEach(t => t.setAttribute('aria-expanded', 'false'));
+  }
+  $$('.nav-group-trigger', topbar).forEach(trigger => {
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const key = trigger.dataset.groupTrigger;
+      const menu = topbar.querySelector(`.nav-group-menu[data-group-menu="${key}"]`);
+      const isOpen = !menu.hidden;
+      closeAll();
+      if (!isOpen) {
+        menu.hidden = false;
+        trigger.setAttribute('aria-expanded', 'true');
+      }
+    });
+  });
+  $$('.nav-group-menu a', topbar).forEach(a => a.addEventListener('click', closeAll));
+  document.addEventListener('click', closeAll);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAll(); });
 }
 
 function setPrivacyMode(on) {
@@ -176,6 +241,10 @@ function setPrivacyMode(on) {
 
 function setActiveTab(routeKey) {
   $$('header.topbar nav a').forEach(a => a.classList.toggle('active', a.dataset.route === routeKey));
+  $$('header.topbar .nav-group-trigger').forEach(trigger => {
+    const group = NAV_GROUPS.find(g => g.key === trigger.dataset.groupTrigger);
+    trigger.classList.toggle('active', !!group && group.routes.includes(routeKey));
+  });
 }
 
 // Generation counter prevents a slow fetch from a stale render() call

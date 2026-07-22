@@ -32,6 +32,19 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(cat["frontend-design"]["chars"], 400)
         self.assertEqual(cat["frontend-design"]["tokens"], 100)
 
+    def test_description_from_frontmatter(self):
+        _write(
+            self.tmp / "skills" / "frontend-design" / "SKILL.md",
+            "---\nname: frontend-design\ndescription: Builds accessible UIs\n---\n\nbody",
+        )
+        cat = scan_catalog([self.tmp / "skills"])
+        self.assertEqual(cat["frontend-design"]["description"], "Builds accessible UIs")
+
+    def test_description_missing_frontmatter_is_empty_string(self):
+        _write(self.tmp / "skills" / "no-frontmatter" / "SKILL.md", "just a body, no frontmatter")
+        cat = scan_catalog([self.tmp / "skills"])
+        self.assertEqual(cat["no-frontmatter"]["description"], "")
+
     def test_plugin_skill_registers_both_slugs(self):
         p = self.tmp / "plugins" / "marketplaces" / "official" / "plugins" / "superpowers" / "skills" / "brainstorming" / "SKILL.md"
         _write(p, "y" * 800)
