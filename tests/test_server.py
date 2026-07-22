@@ -11,7 +11,7 @@ import urllib.request
 import urllib.error
 
 import token_dashboard.server as server
-from token_dashboard.db import init_db
+from token_dashboard.db import init_db, set_setting
 from token_dashboard.server import build_handler
 
 
@@ -253,6 +253,23 @@ class RefreshTests(unittest.TestCase):
         t2.join()
 
         self.assertEqual(calls["scan"], 1)
+
+    def test_refresh_scans_saved_claude_dir_when_no_override(self):
+        # Manual "Refresh now" runs with projects_dir=None (the default: no
+        # --projects-dir / CLAUDE_PROJECTS_DIR override). _do_refresh must
+        # resolve the saved claude_dir to a real projects path before scanning,
+        # not pass the raw None straight to scan_dir (which no-ops).
+        claude_dir = os.path.join(self.tmp, ".claude")
+        project = os.path.join(claude_dir, "projects", "demo")
+        os.makedirs(project)
+        with open(os.path.join(project, "s.jsonl"), "w", encoding="utf-8") as f:
+            f.write('{"type":"user","uuid":"su1","sessionId":"ss1","timestamp":"2026-04-20T00:00:00Z","message":{"role":"user","content":"hi"}}\n')
+        set_setting(self.db, "claude_dir", claude_dir)
+
+        server._do_refresh(self.db, None, {"models": {}, "plans": {}})
+
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
 
 
 if __name__ == "__main__":

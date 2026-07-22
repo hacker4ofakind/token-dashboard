@@ -107,7 +107,7 @@ def _do_refresh(db_path: str, projects_dir: str, pricing: dict) -> None:
         EVENTS.put({"type": "scan-skip", "reason": "already-running", "ts": time.time()})
         return
     try:
-        n = scan_dir(projects_dir, db_path)
+        n = scan_dir(_projects_dir(db_path, projects_dir), db_path)
         _cache_clear()
         EVENTS.put({"type": "scan", "n": n, "ts": time.time()})
     except Exception as e:
