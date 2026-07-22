@@ -10,7 +10,7 @@ Inspired by [phuryn/claude-usage](https://github.com/phuryn/claude-usage) but di
 
 ## Status
 
-Working codebase. Python unit tests live in `tests/` (`python3 -m unittest discover tests`). UI tabs are JS modules in `web/routes/` (Overview, Prompts, Sessions, Projects, Workspaces, Subagents, Skills, RTK, Tips, Settings). Runs on macOS, Windows, and Linux.
+Working codebase. Python unit tests live in `tests/` (`python3 -m unittest discover tests`). UI tabs are JS modules in `web/routes/` (Overview, Prompts, Sessions, Projects, Workspaces, Subagents, Skills, Plugins, MCP, Hooks, RTK, Tips, Settings — Skills/Plugins/MCP/Hooks are grouped under a "Register ▾" nav dropdown). Runs on macOS, Windows, and Linux.
 
 ## Architecture
 
@@ -37,7 +37,7 @@ Env vars: `PORT` (default 8080), `HOST` (default 127.0.0.1), `CLAUDE_PROJECTS_DI
 
 ## Known limitations
 
-See `docs/KNOWN_LIMITATIONS.md`. Current summary: Skills `tokens_per_call` covers `~/.claude/skills/`, `~/.claude/scheduled-tasks/`, every `installPath` listed in `~/.claude/plugins/installed_plugins.json` (manifest-driven — marketplace clones excluded), plus project-local `.claude/skills/` directories discovered from cwds in the messages table. Only `Task`-dispatched subagent skills still show blank token counts.
+See `docs/KNOWN_LIMITATIONS.md`. Current summary: Skills `tokens_per_call` covers `~/.claude/skills/`, `~/.claude/scheduled-tasks/`, every `installPath` listed in `~/.claude/plugins/installed_plugins.json` (manifest-driven — marketplace clones excluded), plus project-local `.claude/skills/` directories discovered from cwds in the messages table. Only `Task`-dispatched subagent skills still show blank token counts. The **Register** catalogs (Plugins / MCP / Hooks) are manifest-driven the same way — installed plugins only, marketplace clones and disabled plugins excluded; the MCP page scans local `~/.claude.json` servers plus installed-plugin `.mcp.json` files and never lists account-level claude.ai connectors (no local config to read).
 
 ## Verifying changes
 

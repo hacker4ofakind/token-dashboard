@@ -8,6 +8,14 @@ The Skills route shows every skill Claude Code invoked, how many times, across h
 
 Cost attribution for orchestrator skills — any skill that dispatches subagents via `Task`/`Agent` — follows the `parent_uuid` chain from every dispatch back to the skill call that emitted it. The `total inc. subagents` column on the Skills tab reflects that. If you upgraded from an older build and the column looks low, run `python3 cli.py rescan-agent-targets` once to re-parse main-session JSONLs whose Agent rows lost their `subagent_type` target.
 
+## The MCP page lists local and plugin-shipped servers, not claude.ai connectors
+
+The MCP page under **Register** shows the MCP servers it can read from disk: local servers configured in `~/.claude.json` (top-level or project-scoped `mcpServers`) and servers bundled by installed, enabled plugins (their `.mcp.json`). Account-level connectors you've enabled on claude.ai — Gmail, Calendar, Slack and the like — are **not** shown. They have no local config file (the only on-disk trace is a stale, incomplete "ever connected" name list), so there's nothing reliable to scan. The page shows only what it can read, which is why it needs no hand-maintained connector file.
+
+## Register catalogs (Plugins / MCP / Hooks) are manifest-driven
+
+The Plugins, MCP and Hooks/Commands/Agents pages only list plugins recorded in `~/.claude/plugins/installed_plugins.json`. Plugins enabled from a local marketplace *clone* rather than cache-installed through the manifest are excluded — the same rule the skill catalog uses, so counts stay consistent across tabs. Disabled plugins are skipped too. A hook whose `settings.json` command is inline (no script path) or uses a backslash-only Windows path shows up without a resolvable script link.
+
 ## The Prompts tab shows your main-thread prompts only
 
 The Prompts route lists each typed prompt and the assistant work it triggered, linked by **session + timestamp window**. Newer Claude Code versions interpose `attachment` records between a prompt and its assistant turn (and put no `promptId` on assistant rows), so the original `parent_uuid` link became unreliable and the tab appeared frozen — see `FORK_NOTES.md`. Two consequences of the window-based linkage:
