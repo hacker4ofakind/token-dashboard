@@ -280,7 +280,7 @@ async function firstRun() {
       <h2>Welcome — pick your plan</h2>
       <p>This sets how costs are displayed. Change it later in Settings.</p>
       <select id="firstplan" class="blur-sensitive" style="width:100%">
-        ${plans.map(([k,v]) => `<option value="${k}">${v.label}${v.monthly ? ` — $${v.monthly}/mo` : ''}</option>`).join('')}
+        ${plans.map(([k,v]) => `<option value="${fmt.htmlSafe(k)}">${fmt.htmlSafe(v.label)}${v.monthly ? ` — $${v.monthly}/mo` : ''}</option>`).join('')}
       </select>
       <div class="actions">
         <div class="spacer"></div>

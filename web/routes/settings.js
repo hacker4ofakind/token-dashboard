@@ -13,7 +13,7 @@ export default async function (root) {
       <p class="muted" style="margin:0 0 12px">Changes how costs are labelled, not the numbers. The dollar figures shown everywhere are always the <strong>API pay-per-token value</strong> of your usage.<br>Picking a subscription keeps those same figures and just shows your <strong>flat monthly fee</strong> next to them — handy for checking whether your usage is worth more than you pay.</p>
       <div class="flex">
         <select id="plan" class="blur-sensitive">
-          ${plans.map(([k,v]) => `<option value="${k}" ${k===cur.plan?'selected':''}>${v.label}${v.monthly?` — $${v.monthly}/mo`:''}</option>`).join('')}
+          ${plans.map(([k,v]) => `<option value="${fmt.htmlSafe(k)}" ${k===cur.plan?'selected':''}>${fmt.htmlSafe(v.label)}${v.monthly?` — $${v.monthly}/mo`:''}</option>`).join('')}
         </select>
         <button class="primary" id="save">Save</button>
         <span id="msg" class="muted"></span>
@@ -48,7 +48,7 @@ export default async function (root) {
         <thead><tr><th>model</th><th class="num">input</th><th class="num">output</th><th class="num">cache read</th><th class="num">cache 5m</th><th class="num">cache 1h</th></tr></thead>
         <tbody>
           ${Object.entries(cur.pricing.models).map(([k,v]) => `
-            <tr><td><span class="badge ${v.tier}">${k}</span></td>
+            <tr><td><span class="badge ${fmt.htmlSafe(v.tier)}">${fmt.htmlSafe(k)}</span></td>
               <td class="num">$${v.input.toFixed(2)}</td>
               <td class="num">$${v.output.toFixed(2)}</td>
               <td class="num">$${v.cache_read.toFixed(2)}</td>
