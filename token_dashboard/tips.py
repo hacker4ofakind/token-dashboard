@@ -98,7 +98,7 @@ def cache_discipline_tips(db_path, today_iso: Optional[str] = None) -> List[dict
        GROUP BY project_slug
        HAVING (cr + rebuild) > 100000
     """
-    out = []
+    insts = []
     with connect(db_path) as c:
         for row in c.execute(sql, (since,)):
             total = (row["cr"] or 0) + (row["rebuild"] or 0)
@@ -115,23 +115,24 @@ def cache_discipline_tips(db_path, today_iso: Optional[str] = None) -> List[dict
                         LIMIT 1""",
                     (row["project_slug"], since),
                 ).fetchone()
-                links = [
-                    _session_link(worst_session["session_id"] if worst_session else None,
-                                  "Worst session in this project"),
-                    _doc_link("Anthropic: prompt caching",
-                              "https://platform.claude.com/docs/en/build-with-claude/prompt-caching"),
-                ]
-                out.append(_make_tip(
-                    key=key, category="cache", severity="warning",
-                    title=f"Low cache hit rate in {row['project_slug']}",
-                    body=(f"Cache hit rate is {hit*100:.0f}% over the last 7 days. "
-                          "Pauses over 5 minutes invalidate the prompt cache, so sessions that "
-                          "restart context frequently rebuild it. Consider longer-lived sessions "
-                          "or fewer /clear resets."),
-                    scope=row["project_slug"],
-                    links=links,
+                insts.append(_instance(
+                    title=f"{row['project_slug']}: {hit*100:.0f}% hit rate over 7 days",
+                    key=key,
+                    links=[_session_link(worst_session["session_id"] if worst_session else None,
+                                         "Worst session in this project")],
                 ))
-    return out
+    if not insts:
+        return []
+    return [_make_tip(
+        key=_key("cache", "overall"), category="cache", severity="warning",
+        title="Low cache efficiency",
+        body=("Pauses over 5 minutes invalidate the prompt cache, so sessions that restart "
+              "context frequently rebuild it. Consider longer-lived sessions or fewer /clear "
+              "resets."),
+        scope="overall", instances=insts,
+        links=[_doc_link("Anthropic: prompt caching",
+                          "https://platform.claude.com/docs/en/build-with-claude/prompt-caching")],
+    )]
 
 
 def repeated_target_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
@@ -771,7 +772,7 @@ def repeated_bash_errors_tips(db_path, today_iso: Optional[str] = None) -> List[
        ORDER BY n DESC
        LIMIT 5
     """
-    out = []
+    insts = []
     with connect(db_path) as c:
         for row in c.execute(sql, (since,)):
             cmd = row["cmd"]
@@ -779,18 +780,21 @@ def repeated_bash_errors_tips(db_path, today_iso: Optional[str] = None) -> List[
             if _is_dismissed(db_path, key):
                 continue
             display = (cmd[:80] + "…") if len(cmd) > 80 else cmd
-            out.append(_make_tip(
-                key=key, category="bash-errors", severity="info",
-                title=f"`{display}` failed {row['n']} times",
-                body=("This Bash command produced an error result more than "
-                      f"{row['n']} times in the past 3 days. Repeated identical "
-                      "failures usually mean the underlying cause isn't being "
-                      "investigated. Check the error message in the latest "
-                      "session and address the root cause rather than retrying."),
-                scope=cmd[:200],
+            insts.append(_instance(
+                title=f"`{display}` — failed {row['n']}× in 3 days",
+                key=key,
                 links=[_session_link(row["sample_session"], "Latest occurrence")],
             ))
-    return out
+    if not insts:
+        return []
+    return [_make_tip(
+        key=_key("bash-errors", "overall"), category="bash-errors", severity="info",
+        title="Repeated command failures",
+        body=("A command that keeps failing identically usually means the root cause "
+              "isn't being investigated. Check the latest error and fix the cause rather "
+              "than retrying."),
+        scope="overall", instances=insts,
+    )]
 
 
 # ── New tip: high web-fetch volume ───────────────────────────────────────────
@@ -887,7 +891,7 @@ def opus_only_workspace_tips(db_path, today_iso: Optional[str] = None) -> List[d
        ORDER BY total DESC
        LIMIT 3
     """
-    out = []
+    insts = []
     with connect(db_path) as c:
         for row in c.execute(sql, (since,)):
             project = row["project_slug"]
@@ -895,20 +899,22 @@ def opus_only_workspace_tips(db_path, today_iso: Optional[str] = None) -> List[d
             if _is_dismissed(db_path, key):
                 continue
             pct = (row["opus_n"] or 0) * 100 // (row["total"] or 1)
-            out.append(_make_tip(
-                key=key, category="opus-only", severity="cost",
-                title=f"{project}: {pct}% of turns on Opus",
-                body=(f"{row['opus_n']:,} of {row['total']:,} assistant turns in "
-                      f"the past 14 days ran on Opus. For routine work (file "
-                      "reads, refactors, scaffolding), Sonnet is ~5x cheaper at "
-                      "comparable quality. Reserve Opus for hard reasoning."),
-                scope=project,
-                links=[
-                    _doc_link("Anthropic: choose the right model",
-                              "https://code.claude.com/docs/en/costs"),
-                ],
+            insts.append(_instance(
+                title=f"{project}: {pct}% of {row['total']:,} turns on Opus",
+                key=key,
+                links=[],
             ))
-    return out
+    if not insts:
+        return []
+    return [_make_tip(
+        key=_key("opus-only", "overall"), category="opus-only", severity="cost",
+        title="Opus-heavy projects",
+        body=("Routine work — file reads, refactors, scaffolding — runs well on Sonnet at "
+              "roughly 5× lower cost. Reserve Opus for the hard reasoning."),
+        scope="overall", instances=insts,
+        links=[_doc_link("Anthropic: choose the right model",
+                          "https://code.claude.com/docs/en/costs")],
+    )]
 
 
 # ── New tip: MCP server sprawl ───────────────────────────────────────────────
@@ -1161,7 +1167,7 @@ def bash_bloat_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
        ORDER BY avg_t * n DESC
        LIMIT 10
     """
-    out: List[dict] = []
+    insts: List[dict] = []
     with connect(db_path) as c:
         rows = list(c.execute(sql, (since,)))
 
@@ -1171,7 +1177,7 @@ def bash_bloat_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
         cmd = row["cmd"]
         if _has_output_limiter(cmd):
             continue
-        if len(out) >= 5:
+        if len(insts) >= 5:
             break
         key = _key("bash-bloat", (cmd or "")[:120])
         if _is_dismissed(db_path, key):
@@ -1179,21 +1185,23 @@ def bash_bloat_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
         avg_t = int(row["avg_t"] or 0)
         max_t = int(row["max_t"] or 0)
         display = (cmd[:80] + "…") if len(cmd) > 80 else cmd
-        out.append(_make_tip(
-            key=key, category="bash-bloat", severity="info",
-            title=f"`{display}` averages {avg_t:,} tokens of output",
-            body=(f"Ran {row['n']} times in the past 7 days, avg result "
-                  f"{avg_t:,} tokens (max {max_t:,}). Piping the output through "
-                  "`head`, `tail`, or `Select-Object -First` (PowerShell) would "
-                  "shrink the result Claude has to read back."),
-            scope=cmd[:200],
-            links=[
-                _session_link(row["sample_session"], "Session with this command"),
-                _doc_link("Anthropic: reduce MCP tool overhead",
-                          "https://code.claude.com/docs/en/mcp"),
-            ],
+        insts.append(_instance(
+            title=f"`{display}` — avg {avg_t:,} tokens (max {max_t:,})",
+            key=key,
+            links=[_session_link(row["sample_session"], "Session with this command")],
         ))
-    return out
+    if not insts:
+        return []
+    return [_make_tip(
+        key=_key("bash-bloat", "overall"), category="bash-bloat", severity="info",
+        title="Bash output bloat",
+        body=("Piping output through head, tail, or Select-Object -First (PowerShell) "
+              "shrinks what Claude has to read back. These commands ran without an output "
+              "limiter."),
+        scope="overall", instances=insts,
+        links=[_doc_link("Anthropic: reduce MCP tool overhead",
+                          "https://code.claude.com/docs/en/mcp")],
+    )]
 
 
 # ── New tip: dead skills (zero invocations in 90d) ───────────────────────────

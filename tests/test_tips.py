@@ -50,15 +50,27 @@ class CacheTipTests(unittest.TestCase):
         t = cache_tips[0]
         _assert_tip_shape(self, t)
         self.assertEqual(t["severity"], "warning")
-        hrefs = [l["href"] for l in t["links"]]
-        self.assertIn("#/sessions/sess-worst", hrefs)
-        self.assertTrue(any(h.startswith("https://") for h in hrefs))
+        self.assertTrue(any(l["href"].startswith("https://") for l in t["links"]))
+        self.assertEqual(len(t["instances"]), 1)
+        inst = t["instances"][0]
+        self.assertIn("#/sessions/sess-worst", [l["href"] for l in inst["links"]])
 
     def test_healthy_cache_no_tip(self):
         for i in range(10):
             self._ins(f"2026-04-15T00:00:0{i}Z", "projY", 1_000_000, 50)
         tips = cache_discipline_tips(self.db, today_iso="2026-04-19T00:00:00")
         self.assertFalse(any(t["category"] == "cache" for t in tips))
+
+    def test_cache_dismiss_removes_one_instance(self):
+        self._ins("2026-04-15T00:00:00Z", "projX", 10, 1_000_000, session="sess-a")
+        self._ins("2026-04-15T00:00:00Z", "projZ", 10, 1_000_000, session="sess-b")
+        dismiss_tip(self.db, _key("cache", "projX"))
+        tips = cache_discipline_tips(self.db, today_iso="2026-04-19T00:00:00")
+        cache_tips = [t for t in tips if t["category"] == "cache"]
+        self.assertEqual(len(cache_tips), 1)
+        keys = {i["key"] for i in cache_tips[0]["instances"]}
+        self.assertNotIn(_key("cache", "projX"), keys)
+        self.assertIn(_key("cache", "projZ"), keys)
 
 
 class RepeatTipTests(unittest.TestCase):
@@ -245,7 +257,7 @@ class DismissTests(unittest.TestCase):
     def test_dismissed_tip_doesnt_reappear(self):
         tips_before = cache_discipline_tips(self.db, today_iso="2026-04-19T00:00:00")
         self.assertTrue(tips_before)
-        dismiss_tip(self.db, tips_before[0]["key"])
+        dismiss_tip(self.db, tips_before[0]["instances"][0]["key"])
         tips_after = cache_discipline_tips(self.db, today_iso="2026-04-19T00:00:00")
         self.assertFalse(tips_after)
 
@@ -670,9 +682,34 @@ class BashBloatTests(unittest.TestCase):
         t = tips[0]
         _assert_tip_shape(self, t)
         self.assertEqual(t["category"], "bash-bloat")
-        self.assertIn("find /", t["title"])
-        hrefs = [l["href"] for l in t["links"]]
+        self.assertEqual(t["title"], "Bash output bloat")
+        self.assertEqual(len(t["instances"]), 1)
+        inst = t["instances"][0]
+        self.assertIn("find /", inst["title"])
+        hrefs = [l["href"] for l in inst["links"]]
         self.assertTrue(any("#/sessions/" in h for h in hrefs))
+
+    def test_bash_bloat_dismiss_removes_one_instance(self):
+        for i in range(2):
+            self._seed_bash_with_result(
+                cmd="find / -name '*.py'",
+                result_tokens=20_000,
+                tool_use_id=f"tuA{i}",
+                ts=f"2026-05-15T00:0{i}:00Z",
+            )
+        for i in range(2):
+            self._seed_bash_with_result(
+                cmd="find /var -name '*.log'",
+                result_tokens=20_000,
+                tool_use_id=f"tuB{i}",
+                ts=f"2026-05-15T00:0{i}:00Z",
+            )
+        dismiss_tip(self.db, _key("bash-bloat", "find / -name '*.py'"))
+        tips = bash_bloat_tips(self.db, today_iso="2026-05-16T00:00:00")
+        self.assertEqual(len(tips), 1)
+        keys = {i["key"] for i in tips[0]["instances"]}
+        self.assertNotIn(_key("bash-bloat", "find / -name '*.py'"), keys)
+        self.assertIn(_key("bash-bloat", "find /var -name '*.log'"), keys)
 
     def test_command_with_limiter_not_flagged(self):
         # Same big output, but limiter already present → don't nag the user.
@@ -837,8 +874,30 @@ class RepeatedBashErrorsTests(unittest.TestCase):
             )
         tips = repeated_bash_errors_tips(self.db, today_iso="2026-05-16T00:00:00")
         self.assertTrue(tips)
-        _assert_tip_shape(self, tips[0])
-        self.assertEqual(tips[0]["category"], "bash-errors")
+        t = tips[0]
+        _assert_tip_shape(self, t)
+        self.assertEqual(t["category"], "bash-errors")
+        self.assertEqual(t["title"], "Repeated command failures")
+        self.assertEqual(len(t["instances"]), 1)
+        self.assertIn("docker compose up", t["instances"][0]["title"])
+
+    def test_bash_errors_dismiss_removes_one_instance(self):
+        for i in range(3):
+            self._seed_error(
+                cmd="docker compose up", tool_use_id=f"tuA{i}",
+                ts=f"2026-05-15T00:0{i}:00Z",
+            )
+        for i in range(3):
+            self._seed_error(
+                cmd="npm run build", tool_use_id=f"tuB{i}",
+                ts=f"2026-05-15T00:0{i}:00Z",
+            )
+        dismiss_tip(self.db, _key("bash-errors", "docker compose up"))
+        tips = repeated_bash_errors_tips(self.db, today_iso="2026-05-16T00:00:00")
+        self.assertEqual(len(tips), 1)
+        keys = {i["key"] for i in tips[0]["instances"]}
+        self.assertNotIn(_key("bash-errors", "docker compose up"), keys)
+        self.assertIn(_key("bash-errors", "npm run build"), keys)
 
     def test_two_identical_errors_not_flagged(self):
         for i in range(2):
@@ -970,9 +1029,26 @@ class OpusOnlyWorkspaceTests(unittest.TestCase):
                                  model="claude-opus-4-7")
         tips = opus_only_workspace_tips(self.db, today_iso="2026-05-16T00:00:00")
         self.assertTrue(tips)
-        _assert_tip_shape(self, tips[0])
-        self.assertEqual(tips[0]["severity"], "cost")
-        self.assertIn("heavy-proj", tips[0]["title"])
+        t = tips[0]
+        _assert_tip_shape(self, t)
+        self.assertEqual(t["severity"], "cost")
+        self.assertEqual(t["title"], "Opus-heavy projects")
+        self.assertEqual(len(t["instances"]), 1)
+        self.assertIn("heavy-proj", t["instances"][0]["title"])
+
+    def test_opus_only_dismiss_removes_one_instance(self):
+        for i in range(55):
+            self._seed_assistant(uuid=f"a{i}", project="heavy-proj-a",
+                                 model="claude-opus-4-7")
+        for i in range(55):
+            self._seed_assistant(uuid=f"b{i}", project="heavy-proj-b",
+                                 model="claude-opus-4-7")
+        dismiss_tip(self.db, _key("opus-only", "heavy-proj-a"))
+        tips = opus_only_workspace_tips(self.db, today_iso="2026-05-16T00:00:00")
+        self.assertEqual(len(tips), 1)
+        keys = {i["key"] for i in tips[0]["instances"]}
+        self.assertNotIn(_key("opus-only", "heavy-proj-a"), keys)
+        self.assertIn(_key("opus-only", "heavy-proj-b"), keys)
 
     def test_mixed_project_not_flagged(self):
         for i in range(30):
