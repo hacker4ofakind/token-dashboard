@@ -10,8 +10,10 @@ import unittest
 import urllib.request
 import urllib.error
 
+from pathlib import Path
+
 import token_dashboard.server as server
-from token_dashboard.db import init_db
+from token_dashboard.db import init_db, set_setting
 from token_dashboard.server import build_handler
 
 
@@ -213,6 +215,66 @@ class ServerTests(unittest.TestCase):
         self.assertIsNone(body["summary"])
 
 
+class ResolveStaticTests(unittest.TestCase):
+    def test_contains_and_rejects_escapes(self):
+        tmp = tempfile.mkdtemp()
+        root = Path(tmp) / "web"
+        root.mkdir()
+        (root / "app.js").write_text("ok", encoding="utf-8")
+        sibling = Path(tmp) / "web-secret"  # shares the "web" prefix
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("nope", encoding="utf-8")
+
+        # A real file inside the root resolves.
+        self.assertEqual(server._resolve_static(root, "app.js"), (root / "app.js").resolve())
+        # A missing file is None (not an escape, just absent).
+        self.assertIsNone(server._resolve_static(root, "missing.js"))
+        # The sibling whose name shares the "web" prefix must be rejected -
+        # a plain startswith(str(root)) check would have accepted it.
+        self.assertIsNone(server._resolve_static(root, "../web-secret/secret.txt"))
+        # Classic parent traversal is rejected.
+        self.assertIsNone(server._resolve_static(root, "../../etc/passwd"))
+
+
+class EventStreamBrokerTests(unittest.TestCase):
+    def test_publish_fans_out_to_every_subscriber(self):
+        # Two open /api/stream tabs must BOTH receive each event. A single
+        # shared queue would hand it to only one of them.
+        q1 = server._subscribe()
+        q2 = server._subscribe()
+        try:
+            server._publish_event({"type": "scan", "n": 7})
+            self.assertEqual(q1.get_nowait()["n"], 7)
+            self.assertEqual(q2.get_nowait()["n"], 7)
+        finally:
+            server._unsubscribe(q1)
+            server._unsubscribe(q2)
+
+    def test_unsubscribe_stops_delivery(self):
+        q = server._subscribe()
+        server._unsubscribe(q)
+        server._publish_event({"type": "scan", "n": 1})
+        self.assertTrue(q.empty())
+
+
+class McpUsageMatchTests(unittest.TestCase):
+    def test_matches_server_segment_exactly_not_as_substring(self):
+        # MCP tool names are mcp__<server>__<tool>. A "git" server must not
+        # absorb calls belonging to "github" (a substring match would).
+        tools = [
+            {"tool_name": "mcp__github__create_issue", "calls": 5},
+            {"tool_name": "mcp__git__commit", "calls": 3},
+            {"tool_name": "Read", "calls": 99},
+        ]
+        self.assertEqual(server._mcp_usage_calls("git", tools), 3)
+        self.assertEqual(server._mcp_usage_calls("github", tools), 5)
+
+    def test_normalises_spaces_and_returns_none_when_unused(self):
+        tools = [{"tool_name": "mcp__my_server__do", "calls": 4}]
+        self.assertEqual(server._mcp_usage_calls("My Server", tools), 4)
+        self.assertIsNone(server._mcp_usage_calls("absent", tools))
+
+
 class RefreshTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -253,6 +315,23 @@ class RefreshTests(unittest.TestCase):
         t2.join()
 
         self.assertEqual(calls["scan"], 1)
+
+    def test_refresh_scans_saved_claude_dir_when_no_override(self):
+        # Manual "Refresh now" runs with projects_dir=None (the default: no
+        # --projects-dir / CLAUDE_PROJECTS_DIR override). _do_refresh must
+        # resolve the saved claude_dir to a real projects path before scanning,
+        # not pass the raw None straight to scan_dir (which no-ops).
+        claude_dir = os.path.join(self.tmp, ".claude")
+        project = os.path.join(claude_dir, "projects", "demo")
+        os.makedirs(project)
+        with open(os.path.join(project, "s.jsonl"), "w", encoding="utf-8") as f:
+            f.write('{"type":"user","uuid":"su1","sessionId":"ss1","timestamp":"2026-04-20T00:00:00Z","message":{"role":"user","content":"hi"}}\n')
+        set_setting(self.db, "claude_dir", claude_dir)
+
+        server._do_refresh(self.db, None, {"models": {}, "plans": {}})
+
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
 
 
 if __name__ == "__main__":

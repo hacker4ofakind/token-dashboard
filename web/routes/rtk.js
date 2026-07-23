@@ -94,7 +94,7 @@ export default async function (root) {
           <tbody>
             ${data.monthly.map(m => `
               <tr style="border-top:1px solid var(--border)">
-                <td style="padding:6px 0;font-family:var(--mono);font-size:12px">${m.month}</td>
+                <td style="padding:6px 0;font-family:var(--mono);font-size:12px">${fmt.htmlSafe(m.month)}</td>
                 <td style="padding:6px 0;text-align:right;color:var(--good)">${fmt.compact(m.saved_tokens)}</td>
                 <td style="padding:6px 0;text-align:right">${m.savings_pct.toFixed(0)}%</td>
                 <td style="padding:6px 0;text-align:right;color:var(--muted)">${fmt.int(m.commands)}</td>

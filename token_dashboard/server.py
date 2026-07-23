@@ -36,7 +36,33 @@ from .hooks_catalog import scan_hooks, scan_commands, scan_agents
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 PRICING_JSON = Path(__file__).resolve().parent.parent / "pricing.json"
 
-EVENTS: "queue.Queue[dict]" = queue.Queue()
+# Server-sent events fan out to every open /api/stream connection. A single
+# shared queue.Queue would hand each event to just one connection (whichever
+# get() wins), so with two browser tabs open only one would see a scan/error
+# event. Each connection subscribes its own queue; producers broadcast to all.
+_EVENT_SUBS: "set[queue.Queue[dict]]" = set()
+_EVENT_SUBS_LOCK = threading.Lock()
+
+
+def _subscribe() -> "queue.Queue[dict]":
+    q: "queue.Queue[dict]" = queue.Queue()
+    with _EVENT_SUBS_LOCK:
+        _EVENT_SUBS.add(q)
+    return q
+
+
+def _unsubscribe(q) -> None:
+    with _EVENT_SUBS_LOCK:
+        _EVENT_SUBS.discard(q)
+
+
+def _publish_event(evt: dict) -> None:
+    with _EVENT_SUBS_LOCK:
+        subs = list(_EVENT_SUBS)
+    for q in subs:
+        q.put(evt)
+
+
 # Keep cache resets and concurrent scans from interleaving with background scans.
 SCAN_LOCK = threading.Lock()
 
@@ -104,14 +130,14 @@ _WARM_DEFAULT_DAYS = 30          # the range the UI lands on first
 def _do_refresh(db_path: str, projects_dir: str, pricing: dict) -> None:
     """One-shot scan + cache-clear + warm, used by the manual /api/refresh endpoint."""
     if not SCAN_LOCK.acquire(blocking=False):
-        EVENTS.put({"type": "scan-skip", "reason": "already-running", "ts": time.time()})
+        _publish_event({"type": "scan-skip", "reason": "already-running", "ts": time.time()})
         return
     try:
-        n = scan_dir(projects_dir, db_path)
+        n = scan_dir(_projects_dir(db_path, projects_dir), db_path)
         _cache_clear()
-        EVENTS.put({"type": "scan", "n": n, "ts": time.time()})
+        _publish_event({"type": "scan", "n": n, "ts": time.time()})
     except Exception as e:
-        EVENTS.put({"type": "error", "message": str(e)})
+        _publish_event({"type": "error", "message": str(e)})
     finally:
         SCAN_LOCK.release()
 
@@ -195,10 +221,24 @@ def _rtk_payload(home=None) -> dict:
 
 
 
+def _resolve_static(root: Path, rel: str) -> Optional[Path]:
+    """Resolve a request path under ``root``, or None if it escapes or is not a file.
+
+    Containment uses ``relative_to``: a plain ``startswith(str(root))`` check
+    would accept a sibling directory whose name shares the root's prefix
+    (e.g. ``root`` + "-secret"), since the separator isn't part of the compare.
+    """
+    p = (root / rel.lstrip("/")).resolve()
+    try:
+        p.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return p if p.is_file() else None
+
+
 def _serve_static(handler, rel: str) -> None:
-    rel = rel.lstrip("/")
-    p = (WEB_ROOT / rel).resolve()
-    if not str(p).startswith(str(WEB_ROOT.resolve())) or not p.is_file():
+    p = _resolve_static(WEB_ROOT, rel)
+    if p is None:
         handler.send_response(404)
         handler.end_headers()
         return
@@ -209,6 +249,23 @@ def _serve_static(handler, rel: str) -> None:
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def _mcp_usage_calls(server_name: str, tools) -> Optional[int]:
+    """Total tool-call count for one MCP server.
+
+    MCP tool names are ``mcp__<server>__<tool>``; match the server segment
+    exactly so a short name ("git") does not absorb another server's calls
+    ("github"). ``tools`` is a tool_token_breakdown list. Returns None when the
+    server has no recorded calls.
+    """
+    norm = server_name.lower().replace(" ", "_")
+    total = 0
+    for t in tools:
+        parts = t["tool_name"].lower().split("__")
+        if len(parts) >= 3 and parts[0] == "mcp" and parts[1] == norm:
+            total += t["calls"]
+    return total or None
 
 
 def _claude_dir(db_path: str) -> Path:
@@ -515,11 +572,7 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 rows = scan_mcp()
                 tools = tool_token_breakdown(db_path, since, until)
                 for r in rows:
-                    norm = r["name"].lower().replace(" ", "_")
-                    r["usage_calls"] = sum(
-                        t["calls"] for t in tools
-                        if t["tool_name"].startswith("mcp__") and norm in t["tool_name"].lower()
-                    ) or None
+                    r["usage_calls"] = _mcp_usage_calls(r["name"], tools)
                 _cache_set(cache_key, rows)
                 return _send_json(self, rows)
             if path == "/api/hooks":
@@ -542,17 +595,21 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
-                while True:
-                    try:
-                        evt = EVENTS.get(timeout=15)
-                        chunk = f"data: {json.dumps(evt, default=str)}\n\n".encode()
-                    except queue.Empty:
-                        chunk = b": ping\n\n"
-                    try:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
-                        return
+                q = _subscribe()
+                try:
+                    while True:
+                        try:
+                            evt = q.get(timeout=15)
+                            chunk = f"data: {json.dumps(evt, default=str)}\n\n".encode()
+                        except queue.Empty:
+                            chunk = b": ping\n\n"
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+                finally:
+                    _unsubscribe(q)
             self.send_response(404)
             self.end_headers()
 
@@ -620,11 +677,11 @@ def _scan_loop(db_path: str, projects_dir: Optional[str] = None, interval: float
                     # Emit the event even when messages == 0 so the frontend's
                     # "Getting latest data…" banner clears once the scan finishes.
                     # The frontend uses n.messages to decide whether to flag new data.
-                    EVENTS.put({"type": "scan", "n": n, "ts": time.time()})
+                    _publish_event({"type": "scan", "n": n, "ts": time.time()})
                 finally:
                     SCAN_LOCK.release()
         except Exception as e:
-            EVENTS.put({"type": "error", "message": str(e)})
+            _publish_event({"type": "error", "message": str(e)})
         time.sleep(interval)
 
 

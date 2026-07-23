@@ -488,11 +488,13 @@ def rescan_agent_targets(
         if not sessions:
             return {"files_reset": 0, "messages": 0, "tools": 0, "files": 0}
         paths: set[str] = set()
-        for sid in sessions:
-            for row in conn.execute(
-                "SELECT path FROM files WHERE path LIKE ?",
-                (f"%/{sid}.jsonl",),
-            ):
+        wanted = {f"{sid}.jsonl" for sid in sessions}
+        for row in conn.execute("SELECT path FROM files"):
+            # Match on the file's basename, not a "/"-anchored LIKE: files.path is
+            # the OS-native string, so on Windows it carries "\" separators and a
+            # "%/{sid}.jsonl" pattern would never match.
+            name = row["path"].replace("\\", "/").rsplit("/", 1)[-1]
+            if name in wanted:
                 paths.add(row["path"])
         for p in paths:
             conn.execute("UPDATE files SET bytes_read = 0 WHERE path = ?", (p,))
