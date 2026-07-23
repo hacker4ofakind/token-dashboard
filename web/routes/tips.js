@@ -46,12 +46,12 @@ function renderInstances(instances) {
     const links = renderLinks(i.links);
     return `
       <li class="tip-instance">
-        <div class="tip-instance-title blur-sensitive">${fmt.htmlSafe(i.title)}</div>
-        ${detail}
-        <div class="tip-instance-actions">
+        <div class="tip-instance-main">
+          <div class="tip-instance-title blur-sensitive">${fmt.htmlSafe(i.title)}</div>
+          ${detail}
           ${links}
-          <button class="ghost" data-key="${fmt.htmlSafe(i.key)}">dismiss</button>
         </div>
+        <button class="ghost" data-key="${fmt.htmlSafe(i.key)}">dismiss</button>
       </li>`;
   }).join('');
   return `
