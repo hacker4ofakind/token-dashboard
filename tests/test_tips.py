@@ -181,6 +181,38 @@ class OutlierTests(unittest.TestCase):
         self.assertTrue(bloat)
         self.assertEqual(bloat[0]["severity"], "warning")
 
+    def test_tool_bloat_and_subagent_outlier_both_present(self):
+        with connect(self.db) as c:
+            # tool-bloat condition (unchanged single tip).
+            for i in range(6):
+                c.execute("INSERT INTO messages (uuid, session_id, project_slug, type, timestamp) VALUES (?, 'sA','p','user','2026-04-18T00:00:00Z')", (f"tb{i}",))
+                c.execute("INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, result_tokens, timestamp, is_error) VALUES (?, 'sA','p','_tool_result','tu',12000,'2026-04-18T00:00:00Z',0)", (f"tb{i}",))
+            # subagent-outlier condition: agent1 has 9 small runs + 1 huge run.
+            for i in range(9):
+                c.execute(
+                    "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                    "is_sidechain, agent_id, input_tokens, output_tokens) VALUES "
+                    "(?, 'sB','p','assistant','2026-04-18T00:00:00Z',1,'agent1',100,100)",
+                    (f"sub{i}",),
+                )
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp, "
+                "is_sidechain, agent_id, input_tokens, output_tokens) VALUES "
+                "('subbig', 'sB-worst','p','assistant','2026-04-18T00:00:00Z',1,'agent1',60000,10000)"
+            )
+            c.commit()
+        tips = outlier_tips(self.db, today_iso="2026-04-19T00:00:00")
+        bloat = [t for t in tips if t["category"] == "tool-bloat"]
+        self.assertTrue(bloat)
+        self.assertNotIn("instances", bloat[0])
+        sub = [t for t in tips if t["category"] == "subagent-outlier"]
+        self.assertEqual(len(sub), 1)
+        self.assertEqual(sub[0]["title"], "Subagent cost outliers")
+        self.assertEqual(len(sub[0]["instances"]), 1)
+        inst = sub[0]["instances"][0]
+        self.assertIn("agent1", inst["title"])
+        self.assertTrue(any(l["href"] == "#/sessions/sB-worst" for l in inst["links"]))
+
 
 class CrossWorkspaceTipTests(unittest.TestCase):
     def setUp(self):
@@ -215,10 +247,54 @@ class CrossWorkspaceTipTests(unittest.TestCase):
 
     def test_high_cross_workspace_activity_emits_tip(self):
         tips = cross_workspace_tips(self.db, today_iso="2026-05-16T00:00:00")
-        self.assertTrue(any(t["category"] == "cross-workspace" for t in tips))
-        tip = [t for t in tips if t["category"] == "cross-workspace"][0]
-        self.assertIn("ProjA", tip["title"])
-        self.assertIn("ProjB", tip["title"])
+        cw = [t for t in tips if t["category"] == "cross-workspace"]
+        self.assertTrue(cw)
+        tip = cw[0]
+        self.assertEqual(tip["title"], "Cross-workspace file access")
+        self.assertEqual(len(tip["instances"]), 1)
+        inst = tip["instances"][0]
+        self.assertIn("ProjA", inst["title"])
+        self.assertIn("ProjB", inst["title"])
+        self.assertTrue(any(l["href"] == "#/workspaces" for l in tip["links"]))
+
+    def test_cross_workspace_dismiss_removes_one_instance(self):
+        tmp = tempfile.mkdtemp()
+        db = os.path.join(tmp, "cw2.db")
+        init_db(db)
+
+        def seed_leak(tag, slug_src, cwd_src, cwd_tgt):
+            with connect(db) as c:
+                c.execute(
+                    "INSERT INTO messages (uuid, session_id, project_slug, cwd, type, "
+                    "is_sidechain, timestamp, model) VALUES "
+                    "(?,?,?,?, 'assistant',0,'2026-05-15T00:00:00Z','claude-opus-4-7')",
+                    (f"m{tag}", f"s{tag}", slug_src, cwd_src),
+                )
+                for i in range(60):
+                    c.execute(
+                        "INSERT INTO tool_calls (message_uuid, session_id, project_slug, "
+                        "tool_name, target, timestamp, is_error) VALUES "
+                        "(?,?,?,'Read',?,?,0)",
+                        (f"m{tag}", f"s{tag}", slug_src, cwd_tgt + r"\spec.md",
+                         f"2026-05-15T00:0{i//10}:0{i%10}Z"),
+                    )
+                c.commit()
+
+        seed_leak("1", "C--Users-a-projects-ProjA",
+                   r"C:\Users\a\projects\ProjA", r"C:\Users\a\projects\ProjB")
+        seed_leak("2", "C--Users-a-projects-ProjC",
+                   r"C:\Users\a\projects\ProjC", r"C:\Users\a\projects\ProjD")
+
+        tips_before = cross_workspace_tips(db, today_iso="2026-05-16T00:00:00")
+        cw_before = [t for t in tips_before if t["category"] == "cross-workspace"]
+        self.assertEqual(len(cw_before), 1)
+        self.assertEqual(len(cw_before[0]["instances"]), 2)
+
+        dismiss_tip(db, cw_before[0]["instances"][0]["key"])
+        tips_after = cross_workspace_tips(db, today_iso="2026-05-16T00:00:00")
+        cw_after = [t for t in tips_after if t["category"] == "cross-workspace"]
+        self.assertEqual(len(cw_after), 1)
+        self.assertEqual(len(cw_after[0]["instances"]), 1)
 
     def test_low_activity_under_threshold_no_tip(self):
         tmp = tempfile.mkdtemp()
@@ -777,10 +853,28 @@ class ClaudeMdSizeTests(unittest.TestCase):
         tips = claude_md_size_tips(self.db, today_iso="2026-04-19T00:00:00")
         big = [t for t in tips if t["category"] == "claude-md-size"]
         self.assertTrue(big)
-        _assert_tip_shape(self, big[0])
-        self.assertEqual(big[0]["severity"], "info")
-        # Drill-down link should be the Anthropic docs.
-        self.assertTrue(any(l["href"].startswith("https://") for l in big[0]["links"]))
+        tip = big[0]
+        _assert_tip_shape(self, tip)
+        self.assertEqual(tip["severity"], "info")
+        self.assertEqual(tip["title"], "Oversized CLAUDE.md files")
+        self.assertEqual(len(tip["instances"]), 1)
+        self.assertIn("CLAUDE.md", tip["instances"][0]["title"])
+        # Drill-down link should be the Anthropic docs (group-level).
+        self.assertTrue(any(l["href"].startswith("https://") for l in tip["links"]))
+
+    def test_claude_md_size_dismiss_removes_one_instance(self):
+        proj2 = self.tmp / "proj2"
+        proj2.mkdir()
+        (self.proj / "CLAUDE.md").write_text("# big\n" + ("line\n" * 300), encoding="utf-8")
+        (proj2 / "CLAUDE.md").write_text("# big2\n" + ("line\n" * 300), encoding="utf-8")
+        self._seed_messages(str(self.proj))
+        self._seed_messages(str(proj2))
+        dismiss_tip(self.db, _key("claude-md-size", str(self.proj / "CLAUDE.md")))
+        tips = claude_md_size_tips(self.db, today_iso="2026-04-19T00:00:00")
+        big = [t for t in tips if t["category"] == "claude-md-size"]
+        self.assertEqual(len(big), 1)
+        self.assertEqual(len(big[0]["instances"]), 1)
+        self.assertIn(str(proj2 / "CLAUDE.md"), big[0]["instances"][0]["key"])
 
 
 class ContextPressureTests(unittest.TestCase):
@@ -1128,8 +1222,12 @@ class ClaudeMdStackTests(unittest.TestCase):
         self._seed_cwd(str(nested))
         tips = claude_md_stack_tips(self.db, today_iso="2026-05-16T00:00:00")
         self.assertTrue(tips)
-        _assert_tip_shape(self, tips[0])
-        self.assertEqual(tips[0]["category"], "claude-md-stack")
+        tip = tips[0]
+        _assert_tip_shape(self, tip)
+        self.assertEqual(tip["category"], "claude-md-stack")
+        self.assertEqual(tip["title"], "Stacked CLAUDE.md files")
+        self.assertEqual(len(tip["instances"]), 1)
+        self.assertIn("3 files", tip["instances"][0]["title"])
 
     def test_single_claude_md_not_flagged(self):
         proj = self.tmp / "solo"
@@ -1138,6 +1236,43 @@ class ClaudeMdStackTests(unittest.TestCase):
         self._seed_cwd(str(proj))
         tips = claude_md_stack_tips(self.db, today_iso="2026-05-16T00:00:00")
         self.assertFalse(tips)
+
+    def test_claude_md_stack_dismiss_removes_one_instance(self):
+        def build_stack(root):
+            proj = root / "proj"
+            nested = proj / "sub"
+            nested.mkdir(parents=True)
+            (root / "CLAUDE.md").write_text("# g\n" + ("line\n" * 150), encoding="utf-8")
+            (proj / "CLAUDE.md").write_text("# p\n" + ("line\n" * 150), encoding="utf-8")
+            (nested / "CLAUDE.md").write_text("# n\n" + ("line\n" * 150), encoding="utf-8")
+            return nested
+
+        def seed(tag, cwd):
+            with connect(self.db) as c:
+                for i in range(10):
+                    c.execute(
+                        "INSERT INTO messages (uuid, session_id, project_slug, type, "
+                        "timestamp, cwd) VALUES (?, 's', 'p', 'user', "
+                        "'2026-05-15T00:00:00Z', ?)",
+                        (f"u{tag}-{i}", cwd),
+                    )
+                c.commit()
+
+        nested_a = build_stack(self.tmp / "rootA")
+        nested_b = build_stack(self.tmp / "rootB")
+        seed("a", str(nested_a))
+        seed("b", str(nested_b))
+
+        tips_before = claude_md_stack_tips(self.db, today_iso="2026-05-16T00:00:00")
+        stack_before = [t for t in tips_before if t["category"] == "claude-md-stack"]
+        self.assertEqual(len(stack_before), 1)
+        self.assertEqual(len(stack_before[0]["instances"]), 2)
+
+        dismiss_tip(self.db, stack_before[0]["instances"][0]["key"])
+        tips_after = claude_md_stack_tips(self.db, today_iso="2026-05-16T00:00:00")
+        stack_after = [t for t in tips_after if t["category"] == "claude-md-stack"]
+        self.assertEqual(len(stack_after), 1)
+        self.assertEqual(len(stack_after[0]["instances"]), 1)
 
 
 class SkillBudgetScopeAwarenessTests(unittest.TestCase):

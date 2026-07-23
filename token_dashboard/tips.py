@@ -309,6 +309,7 @@ def outlier_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
                                   "https://code.claude.com/docs/en/mcp"),
                     ],
                 ))
+        sub_insts = []
         for row in c.execute("""
           SELECT agent_id, COUNT(*) AS n,
                  AVG(input_tokens+output_tokens) AS mean_t,
@@ -327,15 +328,20 @@ def outlier_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
                         ORDER BY input_tokens+output_tokens DESC LIMIT 1""",
                     (row["agent_id"], since),
                 ).fetchone()
-                out.append(_make_tip(
-                    key=key, category="subagent-outlier", severity="info",
-                    title=f"Subagent {row['agent_id']} has cost outliers",
-                    body=(f"Largest invocation used {int(row['max_t']):,} tokens vs mean "
-                          f"{int(row['mean_t']):,}. Worth checking what those did differently."),
-                    scope=row["agent_id"],
+                sub_insts.append(_instance(
+                    title=f"{row['agent_id']}: max {int(row['max_t']):,} vs mean {int(row['mean_t']):,} tokens",
+                    key=key,
                     links=[_session_link(worst["session_id"] if worst else None,
                                          "Largest invocation")],
                 ))
+        if sub_insts:
+            out.append(_make_tip(
+                key=_key("subagent-outlier", "overall"), category="subagent-outlier", severity="info",
+                title="Subagent cost outliers",
+                body=("A subagent whose largest run dwarfs its average is worth checking — the "
+                      "outlier invocations may be doing something different or unbounded."),
+                scope="overall", instances=sub_insts,
+            ))
     return out
 
 
@@ -597,7 +603,7 @@ def claude_md_size_tips(db_path, today_iso: Optional[str] = None,
     today_iso = today_iso or datetime.utcnow().isoformat()
     since = _iso_days_ago(today_iso, 30)
 
-    out = []
+    insts = []
     seen_paths: set[str] = set()
     for cwd in _distinct_active_cwds(db_path, since):
         if not cwd:
@@ -627,20 +633,23 @@ def claude_md_size_tips(db_path, today_iso: Optional[str] = None,
                     break
                 # Rough cost: chars-per-line * 0.25 token/char, charged each turn
                 approx_tokens = (len(text) // 4)
-                out.append(_make_tip(
-                    key=key, category="claude-md-size", severity="info",
-                    title=f"CLAUDE.md is {lines} lines — Anthropic suggests under {max_lines}",
-                    body=(f"`{ancestor.name}/CLAUDE.md` weighs ~{approx_tokens:,} tokens and is "
-                          "loaded every turn in this project. Move detailed workflows into "
-                          "on-demand skills, keep only essentials here."),
-                    scope=scope,
-                    links=[
-                        _doc_link("Anthropic: manage costs (CLAUDE.md size)",
-                                  "https://code.claude.com/docs/en/costs"),
-                    ],
+                insts.append(_instance(
+                    title=f"{ancestor.name}/CLAUDE.md — {lines} lines (~{approx_tokens:,} tokens)",
+                    key=key,
+                    links=[],
                 ))
                 break  # one tip per cwd ancestry
-    return out
+    if not insts:
+        return []
+    return [_make_tip(
+        key=_key("claude-md-size", "overall"), category="claude-md-size", severity="info",
+        title="Oversized CLAUDE.md files",
+        body=("CLAUDE.md is loaded every turn. Files past ~200 lines add up fast — move "
+              "detailed workflows into on-demand skills and keep only the essentials here."),
+        scope="overall", instances=insts,
+        links=[_doc_link("Anthropic: manage costs (CLAUDE.md size)",
+                          "https://code.claude.com/docs/en/costs")],
+    )]
 
 
 def cross_workspace_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
@@ -652,7 +661,7 @@ def cross_workspace_tips(db_path, today_iso: Optional[str] = None) -> List[dict]
     today_iso = today_iso or datetime.utcnow().isoformat()
     since = _iso_days_ago(today_iso, 7)
     leaks = cross_workspace_leaks(db_path, limit=10, since=since)
-    out: List[dict] = []
+    insts = []
     for leak in leaks:
         if (leak["calls"] or 0) < 50:
             continue
@@ -660,25 +669,26 @@ def cross_workspace_tips(db_path, today_iso: Optional[str] = None) -> List[dict]
         key = _key("cross-workspace", scope)
         if _is_dismissed(db_path, key):
             continue
-        body = (
-            f"Sessions in {leak['source']} touched files in {leak['target']} "
-            f"{leak['calls']} times across {leak['sessions']} sessions in the past 7 days."
-        )
+        inst_title = f"{leak['source']} → {leak['target']}: {leak['calls']} calls across {leak['sessions']} sessions"
         if leak["top_files"]:
             top = leak["top_files"][0]
-            body += f" Top file: {top['path']} ({top['n']} reads)."
-        body += (
-            " If this info is load-bearing, summarize it into the source"
-            " workspace's CLAUDE.md or a memory entry so agents stop crossing."
-        )
-        out.append(_make_tip(
-            key=key, category="cross-workspace", severity="info",
-            title=f"{leak['source']} -> {leak['target']}: {leak['calls']} cross-workspace calls",
-            body=body,
-            scope=scope,
-            links=[{"label": "Open Workspaces view", "href": "#/workspaces"}],
+            inst_title += f" · top: {top['path']} ({top['n']})"
+        insts.append(_instance(
+            title=inst_title,
+            key=key,
+            links=[],
         ))
-    return out
+    if not insts:
+        return []
+    return [_make_tip(
+        key=_key("cross-workspace", "overall"), category="cross-workspace", severity="info",
+        title="Cross-workspace file access",
+        body=("When sessions in one workspace keep reaching into another, that shared info "
+              "is a candidate for the source workspace's CLAUDE.md or a memory entry, so "
+              "agents stop crossing."),
+        scope="overall", instances=insts,
+        links=[{"label": "Open Workspaces view", "href": "#/workspaces"}],
+    )]
 
 
 # ── New tip: session approached the context window limit ────────────────────
@@ -988,7 +998,7 @@ def claude_md_stack_tips(db_path, today_iso: Optional[str] = None) -> List[dict]
     today_iso = today_iso or datetime.utcnow().isoformat()
     since = _iso_days_ago(today_iso, 30)
 
-    out = []
+    insts = []
     seen_combos: set[tuple] = set()
     for cwd in _distinct_active_cwds(db_path, since):
         if not cwd:
@@ -1021,24 +1031,23 @@ def claude_md_stack_tips(db_path, today_iso: Optional[str] = None) -> List[dict]
         key = _key("claude-md-stack", scope)
         if _is_dismissed(db_path, key):
             continue
-        files_desc = ", ".join(
-            f"{Path(p).parent.name or Path(p).anchor}/CLAUDE.md ({n}l)"
-            for p, n in stack
-        )
-        out.append(_make_tip(
-            key=key, category="claude-md-stack", severity="info",
-            title=f"{len(stack)} CLAUDE.md files stack to {total_lines} lines",
-            body=(f"Working in `{cwd_path.name}`, the agent reads "
-                  f"{len(stack)} CLAUDE.md files every turn — combined "
-                  f"{total_lines} lines. Stack: {files_desc}. Consider "
-                  "consolidating overlapping guidance into a single layer."),
-            scope=scope,
-            links=[
-                _doc_link("Anthropic: manage costs (CLAUDE.md size)",
-                          "https://code.claude.com/docs/en/costs"),
-            ],
+        insts.append(_instance(
+            title=f"{cwd_path.name}: {len(stack)} files, {total_lines} lines",
+            key=key,
+            links=[],
         ))
-    return out
+    if not insts:
+        return []
+    return [_make_tip(
+        key=_key("claude-md-stack", "overall"), category="claude-md-stack", severity="info",
+        title="Stacked CLAUDE.md files",
+        body=("Each CLAUDE.md layer (global + project + nested) adds context every turn "
+              "even when each is individually within limits. Consider consolidating "
+              "overlapping guidance into one layer."),
+        scope="overall", instances=insts,
+        links=[_doc_link("Anthropic: manage costs (CLAUDE.md size)",
+                          "https://code.claude.com/docs/en/costs")],
+    )]
 
 
 # ── New tip: skills with overlong descriptions ───────────────────────────────
